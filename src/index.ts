@@ -3,6 +3,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import cookieParser from "cookie-parser";
 import mongoose from "mongoose";
+import authRoutes from "./routes/auth.routes";
 
 dotenv.config();
 
@@ -20,6 +21,9 @@ mongoose
   .then(() => console.log("✅ MongoDB Connected Successfully"))
   .catch((err) => console.log("❌ MongoDB Connection Error:", err));
 
+// Routes
+app.use("/api/auth", authRoutes);
+
 // Test Route
 app.get("/", (req, res) => {
   res.send("Movie Booking API is running...");
@@ -28,3 +32,4 @@ app.get("/", (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
+
