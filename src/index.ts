@@ -3,11 +3,22 @@ import cors from "cors";
 import dotenv from "dotenv";
 import cookieParser from "cookie-parser";
 import mongoose from "mongoose";
+
+// ===================== MODELS IMPORT =====================
+import "./models/user.model";
+import "./models/movie.model";
+import "./models/cinema.model";
+import "./models/screen.model";
+import "./models/showtime.model";
+import "./models/booking.model";
+// =====================================================================
+
 import authRoutes from "./routes/auth.routes";
 import movieRoutes from "./routes/movie.routes";
 import cinemaRoutes from "./routes/cinema.routes";
 import screenRoutes from "./routes/screen.routes";
 import showtimeRoutes from "./routes/showtime.routes";
+import bookingRoutes from "./routes/booking.routes";
 
 dotenv.config();
 
@@ -27,18 +38,11 @@ mongoose
 
 // Routes
 app.use("/api/auth", authRoutes);
-
-//Movie
 app.use("/api/movies", movieRoutes);
-
-//Cinema
 app.use("/api/cinemas", cinemaRoutes);
-
-//Screen
 app.use("/api/screens", screenRoutes);
-
-//ShowTime
-app.use("/api/showtimes",showtimeRoutes);
+app.use("/api/showtimes", showtimeRoutes);
+app.use("/api/bookings", bookingRoutes);
 
 // Test Route
 app.get("/", (req, res) => {
@@ -48,4 +52,3 @@ app.get("/", (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
-
