@@ -7,6 +7,7 @@ import authRoutes from "./routes/auth.routes";
 import movieRoutes from "./routes/movie.routes";
 import cinemaRoutes from "./routes/cinema.routes";
 import screenRoutes from "./routes/screen.routes";
+import showtimeRoutes from "./routes/showtime.routes";
 
 dotenv.config();
 
@@ -35,6 +36,9 @@ app.use("/api/cinemas", cinemaRoutes);
 
 //Screen
 app.use("/api/screens", screenRoutes);
+
+//ShowTime
+app.use("/api/showtimes",showtimeRoutes);
 
 // Test Route
 app.get("/", (req, res) => {
