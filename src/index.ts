@@ -12,6 +12,8 @@ import "./models/screen.model";
 import "./models/showtime.model";
 import "./models/booking.model";
 import "./models/food.model";
+import "./models/offer.model";
+
 // =====================================================================
 
 import authRoutes from "./routes/auth.routes";
@@ -21,6 +23,7 @@ import screenRoutes from "./routes/screen.routes";
 import showtimeRoutes from "./routes/showtime.routes";
 import bookingRoutes from "./routes/booking.routes";
 import foodRoutes from "./routes/food.routes";
+import offerRoutes from "./routes/offer.routes";
 
 dotenv.config();
 
@@ -46,6 +49,7 @@ app.use("/api/screens", screenRoutes);
 app.use("/api/showtimes", showtimeRoutes);
 app.use("/api/bookings", bookingRoutes);
 app.use("/api/foods",foodRoutes);
+app.use("/api/offers", offerRoutes);
 
 // Test Route
 app.get("/", (req, res) => {
