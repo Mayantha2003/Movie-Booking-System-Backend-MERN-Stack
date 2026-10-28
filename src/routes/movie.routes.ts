@@ -7,20 +7,20 @@ import {
   updateMovie,
   deleteMovie,
 } from "../controllers/movie.controller";
-// import { authenticate } from "../middleware/auth";
-// import { isAdmin } from "../middleware/admin"; // later
+
+import { authenticate } from "../middleware/auth";
+import { restrictTo } from "../middleware/restrictTo.ts";
 
 const router = Router();
 
-// ===================== PUBLIC ROUTES =====================
+// Public routes
 router.get("/now-showing", getNowShowing);
 router.get("/coming-soon", getComingSoon);
 router.get("/:id", getMovieById);
 
-// ===================== ADMIN ROUTES =====================
-// late authenticate + isAdmin middleware take
-router.post("/", createMovie);
-router.put("/:id", updateMovie);
-router.delete("/:id", deleteMovie);
+// Admin-only routes
+router.post("/", authenticate, restrictTo("ADMIN"), createMovie);
+router.put("/:id", authenticate, restrictTo("ADMIN"), updateMovie);
+router.delete("/:id", authenticate, restrictTo("ADMIN"), deleteMovie);
 
 export default router;

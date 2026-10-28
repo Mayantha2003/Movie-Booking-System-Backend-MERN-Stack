@@ -6,22 +6,19 @@ import {
   updateScreen,
   deleteScreen,
 } from "../controllers/screen.controller";
-//import { protect, restrictTo } from "../middleware/auth";
+
+import { authenticate } from "../middleware/auth";
+import { restrictTo } from "../middleware/restrictTo.ts";
 
 const router = Router();
 
-// Public
+// Public routes
 router.get("/", getAllScreens);
 router.get("/:id", getScreenById);
 
-// Admin only
-// router.post("/", protect, restrictTo("admin"), createScreen);
-// router.put("/:id", protect, restrictTo("admin"), updateScreen);
-// router.delete("/:id", protect, restrictTo("admin"), deleteScreen);
-
-// Temporary without auth (testing)
-router.post("/", createScreen);
-router.put("/:id", updateScreen);
-router.delete("/:id", deleteScreen);
+// Admin-only routes
+router.post("/", authenticate, restrictTo("ADMIN"), createScreen);
+router.put("/:id", authenticate, restrictTo("ADMIN"), updateScreen);
+router.delete("/:id", authenticate, restrictTo("ADMIN"), deleteScreen);
 
 export default router;

@@ -7,19 +7,25 @@ import {
   deleteOffer,
   toggleOfferStatus,
 } from "../controllers/offer.controller";
-// import { authenticate } from "../middleware/auth";
-// import { isAdmin } from "../middleware/admin";
+
+import { authenticate } from "../middleware/auth";
+import { restrictTo } from "../middleware/restrictTo.ts";
 
 const router = Router();
 
-// ===================== PUBLIC ROUTES =====================
+// Public routes
 router.get("/", getAllOffers);
 router.get("/code/:code", getOfferByCode);
 
-// ===================== ADMIN ROUTES =====================
-router.post("/", createOffer);
-router.put("/:id", updateOffer);
-router.delete("/:id", deleteOffer);
-router.patch("/:id/toggle", toggleOfferStatus);
+// Admin-only routes
+router.post("/", authenticate, restrictTo("ADMIN"), createOffer);
+router.put("/:id", authenticate, restrictTo("ADMIN"), updateOffer);
+router.delete("/:id", authenticate, restrictTo("ADMIN"), deleteOffer);
+router.patch(
+  "/:id/toggle",
+  authenticate,
+  restrictTo("ADMIN"),
+  toggleOfferStatus
+);
 
 export default router;

@@ -7,23 +7,20 @@ import {
   deleteCinema,
   getScreensByCinema,
 } from "../controllers/cinema.controller";
-// import { protect, restrictTo } from "../middleware/auth"; // optional - adjust according to your auth middleware
+
+import { authenticate } from "../middleware/auth";
+import { restrictTo } from "../middleware/restrictTo.ts";
 
 const router = Router();
 
 // Public routes
 router.get("/", getAllCinemas);
-router.get("/:id", getCinemaById);
 router.get("/:id/screens", getScreensByCinema);
+router.get("/:id", getCinemaById);
 
-// Admin only routes (uncomment protect & restrictTo if you have auth)
-// router.post("/", protect, restrictTo("admin"), createCinema);
-// router.put("/:id", protect, restrictTo("admin"), updateCinema);
-// router.delete("/:id", protect, restrictTo("admin"), deleteCinema);
-
-//Temporary without auth (for testing)
-router.post("/", createCinema);
-router.put("/:id", updateCinema);
-router.delete("/:id", deleteCinema);
+// Admin-only routes
+router.post("/", authenticate, restrictTo("ADMIN"), createCinema);
+router.put("/:id", authenticate, restrictTo("ADMIN"), updateCinema);
+router.delete("/:id", authenticate, restrictTo("ADMIN"), deleteCinema);
 
 export default router;

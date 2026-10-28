@@ -6,19 +6,21 @@ import {
   getAllBookings,
   cancelBooking,
 } from "../controllers/booking.controller";
-// import { protect } from "../middleware/auth"; // enable later
+
+import { authenticate } from "../middleware/auth";
+import { restrictTo } from "../middleware/restrictTo.ts";
 
 const router = Router();
 
-// Public / Guest + Logged-in
+// Public / Guest routes
 router.post("/", createBooking);
 router.get("/code/:code", getBookingByCode);
 
-// Logged-in only
-router.get("/my-bookings", getMyBookings);
-router.put("/cancel/:id", cancelBooking);
+// Authenticated customer routes
+router.get("/my-bookings", authenticate, getMyBookings);
+router.put("/cancel/:id", authenticate, cancelBooking);
 
-// Admin
-router.get("/", getAllBookings);
+// Admin-only route
+router.get("/", authenticate, restrictTo("ADMIN"), getAllBookings);
 
 export default router;
