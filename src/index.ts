@@ -11,6 +11,7 @@ import "./models/cinema.model";
 import "./models/screen.model";
 import "./models/showtime.model";
 import "./models/booking.model";
+import "./models/food.model";
 // =====================================================================
 
 import authRoutes from "./routes/auth.routes";
@@ -19,6 +20,7 @@ import cinemaRoutes from "./routes/cinema.routes";
 import screenRoutes from "./routes/screen.routes";
 import showtimeRoutes from "./routes/showtime.routes";
 import bookingRoutes from "./routes/booking.routes";
+import foodRoutes from "./routes/food.routes";
 
 dotenv.config();
 
@@ -43,6 +45,7 @@ app.use("/api/cinemas", cinemaRoutes);
 app.use("/api/screens", screenRoutes);
 app.use("/api/showtimes", showtimeRoutes);
 app.use("/api/bookings", bookingRoutes);
+app.use("/api/foods",foodRoutes);
 
 // Test Route
 app.get("/", (req, res) => {
