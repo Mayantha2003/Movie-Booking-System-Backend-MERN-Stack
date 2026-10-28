@@ -5,6 +5,8 @@ import cookieParser from "cookie-parser";
 import mongoose from "mongoose";
 import authRoutes from "./routes/auth.routes";
 import movieRoutes from "./routes/movie.routes";
+import cinemaRoutes from "./routes/cinema.routes";
+import screenRoutes from "./routes/screen.routes";
 
 dotenv.config();
 
@@ -27,6 +29,12 @@ app.use("/api/auth", authRoutes);
 
 //Movie
 app.use("/api/movies", movieRoutes);
+
+//Cinema
+app.use("/api/cinemas", cinemaRoutes);
+
+//Screen
+app.use("/api/screens", screenRoutes);
 
 // Test Route
 app.get("/", (req, res) => {
