@@ -8,7 +8,7 @@ import {
 } from "../controllers/screen.controller";
 
 import { authenticate } from "../middleware/auth";
-import { restrictTo } from "../middleware/restrictTo.ts";
+import { restrictTo } from "../middleware/restrictTo";
 
 const router = Router();
 
