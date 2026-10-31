@@ -1,20 +1,24 @@
 import { Request, Response } from "express";
 import { Booking } from "../models/booking.model";
 import { Showtime } from "../models/showtime.model";
+import { Food } from "../models/food.model";
+import { Offer } from "../models/offer.model";
 import { generateBookingCode } from "../utils/bookingCode";
 import { AuthRequest } from "../middleware/auth";
-import { UserModel } from "../models/user.model"; 
+import { Types } from "mongoose";
 
-// ===================== CREATE BOOKING (Guest + Logged-in) =====================
+// ===================== CREATE BOOKING (Guest + Logged-in + Food + Offer) =====================
 export const createBooking = async (req: Request, res: Response) => {
   try {
     const {
       showtimeId,
-      seats, // [{ row: "A", seatNumber: 5, seatId: "A-5" }, ...]
-      guestInfo, // { name, email, phone } - required for guests
+      seats, // [{ row: "A", seatNumber: 5, seatId: "A-5" }]
+      foodItems, // [{ foodId: "...", quantity: 2 }]
+      offerCode, // "SAVE20"
+      guestInfo, // { name, email, phone }
     } = req.body;
 
-    // 1. Check if showtime exists
+    // 1. Check showtime
     const showtime = await Showtime.findById(showtimeId);
     if (!showtime) {
       return res.status(404).json({ message: "Showtime not found!" });
@@ -35,10 +39,9 @@ export const createBooking = async (req: Request, res: Response) => {
       });
     }
 
-    // 3. Check if user is logged in
-    const userId = (req as AuthRequest).user?.sub || null;
+    // 3. Check logged-in or guest
+    const userId = (req as AuthRequest).user?.sub || undefined;
 
-    // Guest must provide guestInfo
     if (!userId) {
       if (!guestInfo || !guestInfo.name || !guestInfo.email || !guestInfo.phone) {
         return res.status(400).json({
@@ -47,13 +50,107 @@ export const createBooking = async (req: Request, res: Response) => {
       }
     }
 
-    // 4. Calculate total amount
+    // 4. Calculate ticket amount
     const totalSeats = seats.length;
     const ticketPrice = showtime.ticketPrice;
-    const totalAmount = totalSeats * ticketPrice;
-    const finalAmount = totalAmount; // No discount for now
+    const ticketTotal = totalSeats * ticketPrice;
 
-    // 5. Generate unique booking code
+    // 5. Process Food Items
+    let processedFoodItems: any[] = [];
+    let foodTotal = 0;
+
+    if (foodItems && foodItems.length > 0) {
+      for (const item of foodItems) {
+        const food = await Food.findById(item.foodId);
+
+        if (!food) {
+          return res.status(404).json({
+            message: `Food not found: ${item.foodId}`,
+          });
+        }
+
+        if (!food.isAvailable) {
+          return res.status(400).json({
+            message: `${food.name} is currently unavailable!`,
+          });
+        }
+
+        const quantity = item.quantity || 1;
+        const itemTotal = food.price * quantity;
+
+        processedFoodItems.push({
+          food: food._id,
+          name: food.name,
+          quantity,
+          price: food.price,
+        });
+
+        foodTotal += itemTotal;
+      }
+    }
+
+    // 6. Calculate subtotal (before discount)
+    const subTotal = ticketTotal + foodTotal;
+
+    // 7. Process Offer / Promo Code
+    let discountAmount = 0;
+    let appliedOffer: Types.ObjectId | undefined;
+
+    if (offerCode) {
+      const offer = await Offer.findOne({
+        code: offerCode.toUpperCase(),
+        isActive: true,
+      });
+
+      if (!offer) {
+        return res.status(400).json({ message: "Invalid offer code!" });
+      }
+
+      const now = new Date();
+      if (now < offer.validFrom || now > offer.validTo) {
+        return res.status(400).json({
+          message: "This offer is not valid at the moment!",
+        });
+      }
+
+      if (offer.usageLimit && offer.usedCount >= offer.usageLimit) {
+        return res.status(400).json({
+          message: "This offer has reached its usage limit!",
+        });
+      }
+
+      if (offer.minAmount && subTotal < offer.minAmount) {
+        return res.status(400).json({
+          message: `Minimum amount of Rs.${offer.minAmount} required for this offer!`,
+        });
+      }
+
+      // Calculate discount
+      if (offer.discountType === "percentage") {
+        discountAmount = (subTotal * offer.discountValue) / 100;
+
+        if (offer.maxDiscount && discountAmount > offer.maxDiscount) {
+          discountAmount = offer.maxDiscount;
+        }
+      } else {
+        discountAmount = offer.discountValue;
+      }
+
+      if (discountAmount > subTotal) {
+        discountAmount = subTotal;
+      }
+
+      appliedOffer = offer._id;
+
+      // Increase used count
+      offer.usedCount += 1;
+      await offer.save();
+    }
+
+    // 8. Final amount
+    const finalAmount = subTotal - discountAmount;
+
+    // 9. Generate unique booking code
     let bookingCode = generateBookingCode();
     let existing = await Booking.findOne({ bookingCode });
     while (existing) {
@@ -61,7 +158,7 @@ export const createBooking = async (req: Request, res: Response) => {
       existing = await Booking.findOne({ bookingCode });
     }
 
-    // 6. Create booking
+    // 10. Create booking
     const booking = await Booking.create({
       bookingCode,
       user: userId,
@@ -73,22 +170,27 @@ export const createBooking = async (req: Request, res: Response) => {
       seats,
       totalSeats,
       ticketPrice,
-      totalAmount,
+      totalAmount: subTotal,
+      foodItems: processedFoodItems,
+      foodTotal,
+      offer: appliedOffer,
+      discountAmount,
       finalAmount,
       paymentStatus: "Pending",
       bookingStatus: "Confirmed",
     });
 
-    // 7. Reduce available seats in showtime
+    // 11. Reduce available seats
     showtime.availableSeats -= totalSeats;
     await showtime.save();
 
-    // 8. Return populated booking
+    // 12. Return populated booking
     const populatedBooking = await Booking.findById(booking._id)
       .populate("movie", "title poster")
       .populate("cinema", "name location")
       .populate("screen", "name")
-      .populate("showtime", "showDate startTime endTime");
+      .populate("showtime", "showDate startTime endTime")
+      .populate("offer", "code description discountType discountValue");
 
     res.status(201).json({
       message: "Booking created successfully!",
@@ -104,7 +206,9 @@ export const createBooking = async (req: Request, res: Response) => {
 export const getMyBookings = async (req: AuthRequest, res: Response) => {
   try {
     if (!req.user) {
-      return res.status(401).json({ message: "Please login to view your bookings!" });
+      return res.status(401).json({
+        message: "Please login to view your bookings!",
+      });
     }
 
     const bookings = await Booking.find({ user: req.user.sub })
@@ -112,6 +216,7 @@ export const getMyBookings = async (req: AuthRequest, res: Response) => {
       .populate("cinema", "name location city")
       .populate("screen", "name")
       .populate("showtime", "showDate startTime endTime")
+      .populate("offer", "code description")
       .sort({ createdAt: -1 });
 
     res.status(200).json({
@@ -134,7 +239,8 @@ export const getBookingByCode = async (req: Request, res: Response) => {
       .populate("movie", "title poster duration")
       .populate("cinema", "name location city address")
       .populate("screen", "name screenType")
-      .populate("showtime", "showDate startTime endTime ticketPrice");
+      .populate("showtime", "showDate startTime endTime ticketPrice")
+      .populate("offer", "code description discountType discountValue");
 
     if (!booking) {
       return res.status(404).json({ message: "Booking not found!" });
@@ -164,6 +270,7 @@ export const getAllBookings = async (req: Request, res: Response) => {
       .populate("movie", "title")
       .populate("cinema", "name")
       .populate("showtime", "showDate startTime")
+      .populate("offer", "code")
       .sort({ createdAt: -1 });
 
     res.status(200).json({
@@ -188,11 +295,15 @@ export const cancelBooking = async (req: AuthRequest, res: Response) => {
 
     // Only the owner can cancel (for logged-in users)
     if (req.user && booking.user?.toString() !== req.user.sub) {
-      return res.status(403).json({ message: "You can only cancel your own bookings!" });
+      return res.status(403).json({
+        message: "You can only cancel your own bookings!",
+      });
     }
 
     if (booking.bookingStatus === "Cancelled") {
-      return res.status(400).json({ message: "Booking is already cancelled!" });
+      return res.status(400).json({
+        message: "Booking is already cancelled!",
+      });
     }
 
     // Release seats back to showtime
