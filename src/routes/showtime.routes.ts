@@ -4,6 +4,7 @@ import {
   getAllShowtimes,
   getShowtimeById,
   getShowtimesByMovie,
+  getBookedSeats,
   updateShowtime,
   deleteShowtime,
 } from "../controllers/showtime.controller";
@@ -16,6 +17,7 @@ const router = Router();
 // Public routes
 router.get("/", getAllShowtimes);
 router.get("/movie/:movieId", getShowtimesByMovie);
+router.get("/:id/seats", getBookedSeats);
 router.get("/:id", getShowtimeById);
 
 // Admin-only routes

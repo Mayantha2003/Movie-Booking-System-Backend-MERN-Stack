@@ -1,5 +1,7 @@
 import { Request, Response } from "express";
+import { isValidObjectId } from "mongoose";
 import { Showtime } from "../models/showtime.model";
+import { Booking } from "../models/booking.model";
 import { MovieModel } from "../models/movie.model";
 import { Cinema } from "../models/cinema.model";
 import { Screen } from "../models/screen.model";
@@ -179,5 +181,67 @@ export const deleteShowtime = async (req: Request, res: Response) => {
   } catch (error) {
     console.error("DeleteShowtime Error:", error);
     res.status(500).json({ message: "Failed to delete showtime!" });
+  }
+};
+
+// ===================== GET BOOKED SEATS FOR A SHOWTIME =====================
+export const getBookedSeats = async (req: Request, res: Response) => {
+  try {
+    const id = req.params.id as string;
+
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ message: "Invalid showtime id!" });
+    }
+
+    const showtime = await Showtime.findById(id).select(
+      "totalSeats availableSeats"
+    );
+
+    if (!showtime) {
+      return res.status(404).json({ message: "Showtime not found!" });
+    }
+
+    // Cancelled bookings release their seats, so they are excluded
+    const bookings = await Booking.find({
+      showtime: showtime._id,
+      bookingStatus: { $ne: "Cancelled" },
+    })
+      .select("seats")
+      .lean();
+
+    // De-duplicate by seatId (defensive) and keep a stable A1, A2, B1... order
+    const seatMap = new Map<
+      string,
+      { row: string; seatNumber: number; seatId: string }
+    >();
+
+    for (const booking of bookings) {
+      for (const seat of booking.seats) {
+        seatMap.set(seat.seatId, {
+          row: seat.row,
+          seatNumber: seat.seatNumber,
+          seatId: seat.seatId,
+        });
+      }
+    }
+
+    const bookedSeats = [...seatMap.values()].sort(
+      (a, b) => a.row.localeCompare(b.row) || a.seatNumber - b.seatNumber
+    );
+
+    res.status(200).json({
+      message: "Success!",
+      count: bookedSeats.length,
+      data: {
+        showtimeId: showtime._id,
+        totalSeats: showtime.totalSeats,
+        availableSeats: showtime.availableSeats,
+        bookedSeats,
+        bookedSeatIds: bookedSeats.map((s) => s.seatId),
+      },
+    });
+  } catch (error) {
+    console.error("GetBookedSeats Error:", error);
+    res.status(500).json({ message: "Failed to get booked seats!" });
   }
 };

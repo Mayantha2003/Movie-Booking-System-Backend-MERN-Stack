@@ -148,4 +148,17 @@ bookingSchema.index({ "guestInfo.email": 1 });
 bookingSchema.index({ showtime: 1 });
 bookingSchema.index({ bookingStatus: 1 });
 
+// Double-booking guard: a seat can belong to only ONE active (Confirmed) booking per showtime.
+// This is a multikey unique index over seats.seatId, so MongoDB rejects (E11000) a second
+// booking of the same seat even if two requests pass the application-level check together.
+// Cancelled bookings fall outside the partial filter, so their seats become bookable again.
+bookingSchema.index(
+  { showtime: 1, "seats.seatId": 1 },
+  {
+    unique: true,
+    partialFilterExpression: { bookingStatus: "Confirmed" },
+    name: "unique_active_seat_per_showtime",
+  }
+);
+
 export const Booking = model<IBooking>("Booking", bookingSchema);

@@ -1,18 +1,78 @@
 import { Request, Response } from "express";
-import { Booking } from "../models/booking.model";
+import { Booking, IBookedSeat } from "../models/booking.model";
 import { Showtime } from "../models/showtime.model";
 import { Food } from "../models/food.model";
 import { Offer } from "../models/offer.model";
+import { UserModel } from "../models/user.model";
 import { generateBookingCode } from "../utils/bookingCode";
 import { AuthRequest } from "../middleware/auth";
 import { Types } from "mongoose";
+
+// ===================== SEAT HELPERS =====================
+
+// Cleans the seats sent by the client. The seatId is rebuilt from row + seatNumber on the server
+// so a client cannot dodge the double-booking check by sending a different seatId for the same seat.
+// Returns an error message (string) when the input is invalid.
+const normalizeSeats = (input: any): IBookedSeat[] | string => {
+  if (!Array.isArray(input) || input.length === 0) {
+    return "Please select at least one seat!";
+  }
+
+  const seen = new Set<string>();
+  const seats: IBookedSeat[] = [];
+
+  for (const item of input) {
+    const row = typeof item?.row === "string" ? item.row.trim().toUpperCase() : "";
+    const seatNumber = Number(item?.seatNumber);
+
+    if (!/^[A-Z]{1,2}$/.test(row) || !Number.isInteger(seatNumber) || seatNumber < 1) {
+      return "Each seat needs a valid row (e.g. 'B') and seatNumber (e.g. 8)!";
+    }
+
+    const seatId = `${row}-${seatNumber}`;
+    if (seen.has(seatId)) {
+      return `Seat ${seatId} was selected more than once!`;
+    }
+
+    seen.add(seatId);
+    seats.push({ row, seatNumber, seatId });
+  }
+
+  return seats;
+};
+
+// Returns the requested seatIds that already belong to an active (non-cancelled) booking
+const findUnavailableSeatIds = async (
+  showtimeId: Types.ObjectId,
+  seatIds: string[]
+): Promise<string[]> => {
+  const taken = await Booking.find({
+    showtime: showtimeId,
+    bookingStatus: { $ne: "Cancelled" },
+    "seats.seatId": { $in: seatIds },
+  })
+    .select("seats")
+    .lean();
+
+  const takenIds = new Set<string>();
+  for (const booking of taken) {
+    for (const seat of booking.seats) takenIds.add(seat.seatId);
+  }
+
+  return seatIds.filter((id) => takenIds.has(id));
+};
+
+const seatConflictMessage = (seatIds: string[]) =>
+  `${seatIds.length === 1 ? "Seat" : "Seats"} ${seatIds.join(", ")} ${
+    seatIds.length === 1 ? "is" : "are"
+  } already booked. Please choose different seats.`;
 
 // ===================== CREATE BOOKING (Guest + Logged-in + Food + Offer) =====================
 export const createBooking = async (req: Request, res: Response) => {
   try {
     const {
       showtimeId,
-      seats, // [{ row: "A", seatNumber: 5, seatId: "A-5" }]
+      seats: rawSeats, // [{ row: "A", seatNumber: 5, seatId: "A-5" }]
       foodItems, // [{ foodId: "...", quantity: 2 }]
       offerCode, // "SAVE20"
       guestInfo, // { name, email, phone }
@@ -29,8 +89,9 @@ export const createBooking = async (req: Request, res: Response) => {
     }
 
     // 2. Validate seats
-    if (!seats || seats.length === 0) {
-      return res.status(400).json({ message: "Please select at least one seat!" });
+    const seats = normalizeSeats(rawSeats);
+    if (typeof seats === "string") {
+      return res.status(400).json({ message: seats });
     }
 
     if (seats.length > showtime.availableSeats) {
@@ -39,8 +100,32 @@ export const createBooking = async (req: Request, res: Response) => {
       });
     }
 
+    // 2b. Reject seats that are already booked for this showtime
+    const unavailable = await findUnavailableSeatIds(
+      showtime._id,
+      seats.map((s) => s.seatId)
+    );
+    if (unavailable.length > 0) {
+      return res.status(409).json({
+        message: seatConflictMessage(unavailable),
+        unavailableSeats: unavailable,
+      });
+    }
+
     // 3. Check logged-in or guest
     const userId = (req as AuthRequest).user?.sub || undefined;
+
+    // A logged-in booking must point to a real account (token may outlive a deleted user)
+    if (userId) {
+      const userExists = Types.ObjectId.isValid(userId)
+        ? await UserModel.exists({ _id: userId })
+        : null;
+      if (!userExists) {
+        return res.status(401).json({
+          message: "User account not found. Please log in again!",
+        });
+      }
+    }
 
     if (!userId) {
       if (!guestInfo || !guestInfo.name || !guestInfo.email || !guestInfo.phone) {
@@ -95,6 +180,7 @@ export const createBooking = async (req: Request, res: Response) => {
     // 7. Process Offer / Promo Code
     let discountAmount = 0;
     let appliedOffer: Types.ObjectId | undefined;
+    let offerToCount: Types.ObjectId | undefined; // usedCount is increased only after the booking is saved
 
     if (offerCode) {
       const offer = await Offer.findOne({
@@ -141,10 +227,7 @@ export const createBooking = async (req: Request, res: Response) => {
       }
 
       appliedOffer = offer._id;
-
-      // Increase used count
-      offer.usedCount += 1;
-      await offer.save();
+      offerToCount = offer._id;
     }
 
     // 8. Final amount
@@ -159,30 +242,55 @@ export const createBooking = async (req: Request, res: Response) => {
     }
 
     // 10. Create booking
-    const booking = await Booking.create({
-      bookingCode,
-      user: userId,
-      guestInfo: userId ? undefined : guestInfo,
-      showtime: showtime._id,
-      movie: showtime.movie,
-      cinema: showtime.cinema,
-      screen: showtime.screen,
-      seats,
-      totalSeats,
-      ticketPrice,
-      totalAmount: subTotal,
-      foodItems: processedFoodItems,
-      foodTotal,
-      offer: appliedOffer,
-      discountAmount,
-      finalAmount,
-      paymentStatus: "Pending",
-      bookingStatus: "Confirmed",
-    });
+    // The unique index (showtime + seats.seatId) makes this insert atomic: if another request
+    // booked the same seat a moment ago, MongoDB throws E11000 and nothing is saved.
+    let booking;
+    try {
+      booking = await Booking.create({
+        bookingCode,
+        user: userId,
+        guestInfo: userId ? undefined : guestInfo,
+        showtime: showtime._id,
+        movie: showtime.movie,
+        cinema: showtime.cinema,
+        screen: showtime.screen,
+        seats,
+        totalSeats,
+        ticketPrice,
+        totalAmount: subTotal,
+        foodItems: processedFoodItems,
+        foodTotal,
+        offer: appliedOffer,
+        discountAmount,
+        finalAmount,
+        paymentStatus: "Pending",
+        bookingStatus: "Confirmed",
+      });
+    } catch (err: any) {
+      if (err?.code === 11000 && err?.keyPattern?.["seats.seatId"]) {
+        const nowTaken = await findUnavailableSeatIds(
+          showtime._id,
+          seats.map((s) => s.seatId)
+        );
+        const ids = nowTaken.length > 0 ? nowTaken : seats.map((s) => s.seatId);
+        return res.status(409).json({
+          message: seatConflictMessage(ids),
+          unavailableSeats: ids,
+        });
+      }
+      throw err; // handled by the outer catch (500)
+    }
 
-    // 11. Reduce available seats
-    showtime.availableSeats -= totalSeats;
-    await showtime.save();
+    // 11. Side effects, only after the booking is safely saved
+    // Atomic decrement (instead of read-modify-write) so concurrent bookings cannot overwrite each other
+    await Showtime.updateOne(
+      { _id: showtime._id },
+      { $inc: { availableSeats: -totalSeats } }
+    );
+
+    if (offerToCount) {
+      await Offer.updateOne({ _id: offerToCount }, { $inc: { usedCount: 1 } });
+    }
 
     // 12. Return populated booking
     const populatedBooking = await Booking.findById(booking._id)
@@ -209,6 +317,10 @@ export const getMyBookings = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({
         message: "Please login to view your bookings!",
       });
+    }
+
+    if (!Types.ObjectId.isValid(req.user.sub)) {
+      return res.status(401).json({ message: "Invalid user session!" });
     }
 
     const bookings = await Booking.find({ user: req.user.sub })
