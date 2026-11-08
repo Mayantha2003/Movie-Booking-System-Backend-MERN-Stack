@@ -24,6 +24,8 @@ import showtimeRoutes from "./routes/showtime.routes";
 import bookingRoutes from "./routes/booking.routes";
 import foodRoutes from "./routes/food.routes";
 import offerRoutes from "./routes/offer.routes";
+import adminRoutes from "./routes/admin.routes";
+import superAdminRoutes from "./routes/superAdmin.routes";
 
 dotenv.config();
 
@@ -50,6 +52,8 @@ app.use("/api/showtimes", showtimeRoutes);
 app.use("/api/bookings", bookingRoutes);
 app.use("/api/foods",foodRoutes);
 app.use("/api/offers", offerRoutes);
+app.use("/api/admin", adminRoutes);
+app.use("/api/super-admin", superAdminRoutes);
 
 // Test Route
 app.get("/", (req, res) => {

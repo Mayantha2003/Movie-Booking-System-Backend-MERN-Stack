@@ -8,7 +8,7 @@ import {
 } from "../controllers/booking.controller";
 
 import { authenticate } from "../middleware/auth";
-import { optionalAuthenticate } from "../middleware/Optionalauth";
+import { optionalAuthenticate } from "../middleware/optionalauth";
 import { restrictTo } from "../middleware/restrictTo";
 
 const router = Router();

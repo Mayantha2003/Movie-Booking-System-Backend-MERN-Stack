@@ -16,6 +16,9 @@ export interface IMovie extends Document {
   rating?: number;
 }
 
+const HTTP_URL = /^https?:\/\/\S+$/i;
+const YOUTUBE_URL = /^https?:\/\/(www\.|m\.)?(youtube\.com|youtu\.be|youtube-nocookie\.com)\/\S+$/i;
+
 const movieSchema = new Schema<IMovie>(
   {
     title: {
@@ -48,15 +51,23 @@ const movieSchema = new Schema<IMovie>(
       enum: ["now_showing", "coming_soon"],
       default: "coming_soon",
     },
+    // Full PUBLIC image URL (Supabase Storage), e.g. https://xyz.supabase.co/storage/v1/object/public/movie-posters/posters/abc.jpg
     poster: {
       type: String,
       required: true,
+      trim: true,
+      match: [HTTP_URL, "Poster must be a full http(s) link"],
     },
     banner: {
       type: String,
+      trim: true,
+      match: [HTTP_URL, "Banner must be a full http(s) link"],
     },
+    // YouTube link, e.g. https://www.youtube.com/watch?v=XXXXXXXXXXX or https://youtu.be/XXXXXXXXXXX
     trailer_url: {
       type: String,
+      trim: true,
+      match: [YOUTUBE_URL, "Trailer must be a YouTube link"],
     },
     cast: {
       type: [String],

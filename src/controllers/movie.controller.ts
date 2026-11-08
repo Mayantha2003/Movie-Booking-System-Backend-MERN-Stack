@@ -1,5 +1,12 @@
 import { Request, Response } from "express";
 import { MovieModel } from "../models/movie.model";
+import { detectImageType, uploadImage, deleteImageByUrl } from "../utils/storage";
+
+const YOUTUBE_URL = /^https?:\/\/(www\.|m\.)?(youtube\.com|youtu\.be|youtube-nocookie\.com)\/\S+$/i;
+const isBlankOrYouTube = (v: unknown) => v === undefined || v === null || v === "" || (typeof v === "string" && YOUTUBE_URL.test(v.trim()));
+
+const validationMessage = (error: any, fallback: string) =>
+  Object.values(error.errors as Record<string, any>)[0]?.message || fallback;
 
 // ===================== GET NOW SHOWING =====================
 export const getNowShowing = async (req: Request, res: Response) => {
@@ -80,6 +87,10 @@ export const createMovie = async (req: Request, res: Response) => {
       return res.status(400).json({ message: "Required fields are missing!" });
     }
 
+    if (!isBlankOrYouTube(trailer_url)) {
+      return res.status(400).json({ message: "Trailer must be a YouTube link!" });
+    }
+
     const newMovie = await MovieModel.create({
       title,
       description,
@@ -100,7 +111,10 @@ export const createMovie = async (req: Request, res: Response) => {
       message: "Movie created successfully!",
       data: newMovie,
     });
-  } catch (error) {
+  } catch (error: any) {
+    if (error?.name === "ValidationError") {
+      return res.status(400).json({ message: validationMessage(error, "Invalid movie data!") });
+    }
     console.error("Create Movie Error:", error);
     res.status(500).json({ message: "Failed to create movie!" });
   }
@@ -111,6 +125,15 @@ export const updateMovie = async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
 
+    if (!isBlankOrYouTube(req.body.trailer_url)) {
+      return res.status(400).json({ message: "Trailer must be a YouTube link!" });
+    }
+
+    const existing = await MovieModel.findById(id);
+    if (!existing) {
+      return res.status(404).json({ message: "Movie not found!" });
+    }
+
     const updatedMovie = await MovieModel.findByIdAndUpdate(id, req.body, {
       new: true,
       runValidators: true,
@@ -120,11 +143,22 @@ export const updateMovie = async (req: Request, res: Response) => {
       return res.status(404).json({ message: "Movie not found!" });
     }
 
+    // The image was replaced: remove the old file from storage (ignored if it is not ours).
+    if (typeof req.body.poster === "string" && req.body.poster !== existing.poster) {
+      void deleteImageByUrl(existing.poster);
+    }
+    if (typeof req.body.banner === "string" && req.body.banner !== existing.banner) {
+      void deleteImageByUrl(existing.banner);
+    }
+
     res.status(200).json({
       message: "Movie updated successfully!",
       data: updatedMovie,
     });
-  } catch (error) {
+  } catch (error: any) {
+    if (error?.name === "ValidationError") {
+      return res.status(400).json({ message: validationMessage(error, "Invalid movie data!") });
+    }
     console.error("Update Movie Error:", error);
     res.status(500).json({ message: "Failed to update movie!" });
   }
@@ -141,11 +175,44 @@ export const deleteMovie = async (req: Request, res: Response) => {
       return res.status(404).json({ message: "Movie not found!" });
     }
 
+    void deleteImageByUrl(deletedMovie.poster);
+    void deleteImageByUrl(deletedMovie.banner);
+
     res.status(200).json({
       message: "Movie deleted successfully!",
     });
   } catch (error) {
     console.error("Delete Movie Error:", error);
     res.status(500).json({ message: "Failed to delete movie!" });
+  }
+};
+
+// ===================== UPLOAD MOVIE IMAGE (Admin) =====================
+// POST /api/movies/upload-image?kind=poster|banner   (multipart, field name "image")
+// Returns the full public URL. The admin form puts it into the movie's poster / banner field.
+export const uploadMovieImage = async (req: Request, res: Response) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: "No image uploaded! Send it in the 'image' field." });
+    }
+
+    const type = detectImageType(req.file.buffer);
+    if (!type) {
+      return res.status(400).json({ message: "The file is not a valid JPG, PNG or WebP image!" });
+    }
+
+    const folder = req.query.kind === "banner" ? "banners" : "posters";
+    const { url, path } = await uploadImage(req.file.buffer, type, folder);
+
+    res.status(201).json({
+      message: "Image uploaded successfully!",
+      data: { url, path },
+    });
+  } catch (error: any) {
+    console.error("Upload Movie Image Error:", error);
+    const notConfigured = String(error?.message).includes("not configured");
+    res.status(notConfigured ? 500 : 502).json({
+      message: notConfigured ? "Image storage is not configured on the server!" : "Failed to upload the image. Please try again.",
+    });
   }
 };

@@ -1,7 +1,7 @@
 import { Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import { UserModel, UserRole } from "../models/user.model";
+import { UserModel, UserRole, UserStatus } from "../models/user.model";
 import { signAccessToken, signRefreshToken } from "../utils/token";
 import { AuthRequest } from "../middleware/auth";
 
@@ -39,6 +39,64 @@ export const register = async (req: Request, res: Response) => {
   }
 };
 
+// ===================== CREATE ADMIN =====================
+export const createAdmin = async (req: AuthRequest, res: Response) => {
+  try {
+    const {
+      first_name,
+      last_name,
+      username,
+      email,
+      phone,
+      password
+    } = req.body;
+
+    if (!first_name || !last_name || !username || !email || !password) {
+      return res.status(400).json({
+        message: "Required fields are missing!"
+      });
+    }
+
+    const existingUser = await UserModel.findOne({
+      $or: [{ username }, { email }]
+    });
+
+    if (existingUser) {
+      return res.status(409).json({
+        message: "Username or Email already exists!"
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const newAdmin = await UserModel.create({
+      first_name,
+      last_name,
+      username,
+      email,
+      phone,
+      password: hashedPassword,
+      user_role: UserRole.ADMIN
+    });
+
+    return res.status(201).json({
+      message: "Admin created successfully!",
+      data: {
+        id: newAdmin._id,
+        username: newAdmin.username,
+        email: newAdmin.email,
+        role: newAdmin.user_role
+      }
+    });
+
+  } catch (error) {
+    console.error("Create Admin Error:", error);
+
+    return res.status(500).json({
+      message: "Admin creation failed!"
+    });
+  }
+};
 // ===================== LOGIN =====================
 export const login = async (req: Request, res: Response) => {
   try {
@@ -56,6 +114,13 @@ export const login = async (req: Request, res: Response) => {
     const isValid = await bcrypt.compare(password, user.password);
     if (!isValid) {
       return res.status(401).json({ message: "Invalid credentials!" });
+    }
+
+    // Blocked accounts cannot sign in
+    if (user.user_status === UserStatus.BLOCKED) {
+      return res
+        .status(403)
+        .json({ message: "Your account has been blocked. Contact the system administrator." });
     }
 
     const accessToken = signAccessToken(user);
@@ -78,7 +143,6 @@ export const login = async (req: Request, res: Response) => {
     res.status(500).json({ message: "Login failed!" });
   }
 };
-
 // ===================== GET MY DETAILS =====================
 export const getMyDetails = async (req: AuthRequest, res: Response) => {
   try {
@@ -116,7 +180,9 @@ export const getRefreshToken = async (req: Request, res: Response) => {
     const payload: any = jwt.verify(refreshToken, JWT_REFRESH_SECRET);
 
     const user = await UserModel.findById(payload.sub);
-    if (!user) {
+
+    // A deleted or blocked account cannot renew its session
+    if (!user || user.user_status === UserStatus.BLOCKED) {
       return res.status(403).json({ message: "Invalid or expired token!" });
     }
 
