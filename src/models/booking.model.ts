@@ -1,4 +1,4 @@
-import { Schema , model , Document, Types } from "mongoose";
+import { Document, Schema, Types, model } from "mongoose";
 
 export interface IGuestInfo {
   name: string;
@@ -33,8 +33,10 @@ export interface IBooking extends Document {
   offer?: Types.ObjectId;
   discountAmount?: number;
   finalAmount: number;
-  paymentStatus: "Pending" | "Paid" | "Failed" | "Refunded";
-  bookingStatus: "Confirmed" | "Cancelled" | "Completed";
+  paymentStatus: "Pending" | "Paid" | "Failed" | "Cancelled" | "Refunded";
+  bookingStatus: "Pending" | "Confirmed" | "Cancelled" | "Completed";
+  holdExpiresAt?: Date | null;
+  paymentTokenHash?: string | null;
   bookedAt: Date;
   createdAt: Date;
   updatedAt: Date;
@@ -49,10 +51,10 @@ const bookingSchema = new Schema<IBooking>(
       uppercase: true,
     },
     user: {
-        type: Schema.Types.ObjectId,
-        ref: "User",        
-        default: null,
-},
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
     guestInfo: {
       name: { type: String, trim: true },
       email: { type: String, trim: true, lowercase: true },
@@ -124,13 +126,22 @@ const bookingSchema = new Schema<IBooking>(
     },
     paymentStatus: {
       type: String,
-      enum: ["Pending", "Paid", "Failed", "Refunded"],
+      enum: ["Pending", "Paid", "Failed", "Cancelled", "Refunded"],
       default: "Pending",
     },
     bookingStatus: {
       type: String,
-      enum: ["Confirmed", "Cancelled", "Completed"],
-      default: "Confirmed",
+      enum: ["Pending", "Confirmed", "Cancelled", "Completed"],
+      default: "Pending",
+    },
+    holdExpiresAt: {
+      type: Date,
+      default: null,
+    },
+    paymentTokenHash: {
+      type: String,
+      default: null,
+      select: false,
     },
     bookedAt: {
       type: Date,
@@ -148,16 +159,16 @@ bookingSchema.index({ "guestInfo.email": 1 });
 bookingSchema.index({ showtime: 1 });
 bookingSchema.index({ bookingStatus: 1 });
 
-// Double-booking guard: a seat can belong to only ONE active (Confirmed) booking per showtime.
+// Double-booking guard: a seat can belong to only ONE live booking per showtime.
 // This is a multikey unique index over seats.seatId, so MongoDB rejects (E11000) a second
 // booking of the same seat even if two requests pass the application-level check together.
-// Cancelled bookings fall outside the partial filter, so their seats become bookable again.
+// Pending bookings hold seats during payment; Cancelled bookings free their seats again.
 bookingSchema.index(
   { showtime: 1, "seats.seatId": 1 },
   {
     unique: true,
-    partialFilterExpression: { bookingStatus: "Confirmed" },
-    name: "unique_active_seat_per_showtime",
+    partialFilterExpression: { bookingStatus: { $in: ["Pending", "Confirmed"] } },
+    name: "unique_held_seat_per_showtime",
   }
 );
 

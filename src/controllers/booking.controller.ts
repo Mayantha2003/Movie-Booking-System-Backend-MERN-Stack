@@ -6,7 +6,15 @@ import { Offer } from "../models/offer.model";
 import { UserModel } from "../models/user.model";
 import { generateBookingCode } from "../utils/bookingCode";
 import { AuthRequest } from "../middleware/auth";
-import { Types } from "mongoose";
+import mongoose, { Types } from "mongoose";
+import { MovieModel } from "../models/movie.model";
+import { Cinema } from "../models/cinema.model";
+import { Screen } from "../models/screen.model";
+import {
+  computeHoldExpiry,
+  generatePaymentToken,
+  releaseExpiredHolds,
+} from "../services/bookingHold.service";
 
 // ===================== SEAT HELPERS =====================
 
@@ -67,6 +75,70 @@ const seatConflictMessage = (seatIds: string[]) =>
     seatIds.length === 1 ? "is" : "are"
   } already booked. Please choose different seats.`;
 
+class BookingFlowError extends Error {
+  constructor(
+    message: string,
+    readonly statusCode: number,
+    readonly responseData?: Record<string, unknown>
+  ) {
+    super(message);
+    this.name = "BookingFlowError";
+  }
+}
+
+const rowNumber = (row: string): number =>
+  [...row].reduce((value, character) => value * 26 + character.charCodeAt(0) - 64, 0);
+
+const validateSeatsAgainstScreen = (
+  seats: IBookedSeat[],
+  screen: {
+    rows: number;
+    seatsPerRow: number;
+    seatLayout?: { row: string; seats: number }[];
+  }
+): string | null => {
+  for (const seat of seats) {
+    if (screen.seatLayout?.length) {
+      const row = screen.seatLayout.find(
+        (layout) => layout.row.toUpperCase() === seat.row
+      );
+      if (!row || seat.seatNumber > row.seats) return seat.seatId;
+    } else if (
+      rowNumber(seat.row) > screen.rows ||
+      seat.seatNumber > screen.seatsPerRow
+    ) {
+      return seat.seatId;
+    }
+  }
+  return null;
+};
+
+const isTransactionUnsupported = (error: unknown): boolean => {
+  if (typeof error !== "object" || error === null) return false;
+  const transactionError = error as {
+    code?: number;
+    message?: string;
+  };
+  return (
+    transactionError.code === 20 &&
+    /Transaction numbers are only allowed|replica set member or mongos/i.test(
+      transactionError.message ?? ""
+    )
+  );
+};
+
+const isDuplicateSeatError = (error: unknown): boolean => {
+  if (typeof error !== "object" || error === null || !("keyPattern" in error)) {
+    return false;
+  }
+  const keyPattern = error.keyPattern;
+  return (
+    typeof keyPattern === "object" &&
+    keyPattern !== null &&
+    "seats.seatId" in keyPattern
+  );
+};
+
 // ===================== CREATE BOOKING (Guest + Logged-in + Food + Offer) =====================
 export const createBooking = async (req: Request, res: Response) => {
   try {
@@ -78,7 +150,13 @@ export const createBooking = async (req: Request, res: Response) => {
       guestInfo, // { name, email, phone }
     } = req.body;
 
-    // 1. Check showtime
+    if (typeof showtimeId !== "string" || !Types.ObjectId.isValid(showtimeId)) {
+      return res.status(400).json({ message: "Invalid showtime id!" });
+    }
+
+    await releaseExpiredHolds({ showtimeId });
+
+    // Validate the full showtime relationship rather than trusting request-supplied IDs.
     const showtime = await Showtime.findById(showtimeId);
     if (!showtime) {
       return res.status(404).json({ message: "Showtime not found!" });
@@ -88,10 +166,48 @@ export const createBooking = async (req: Request, res: Response) => {
       return res.status(400).json({ message: "This showtime is not available!" });
     }
 
-    // 2. Validate seats
+    const [movie, cinema, screen] = await Promise.all([
+      MovieModel.findById(showtime.movie).select("_id"),
+      Cinema.findById(showtime.cinema).select("_id isActive"),
+      Screen.findById(showtime.screen).select(
+        "_id cinema isActive totalSeats rows seatsPerRow seatLayout"
+      ),
+    ]);
+
+    if (!movie || !cinema || !screen) {
+      return res.status(409).json({
+        message: "This showtime has invalid movie, cinema, or screen details.",
+      });
+    }
+    if (!cinema.isActive || !screen.isActive) {
+      return res.status(400).json({
+        message: "This cinema or screen is not available!",
+      });
+    }
+    if (
+      screen.cinema.toString() !== showtime.cinema.toString() ||
+      screen.totalSeats !== showtime.totalSeats ||
+      !Number.isFinite(showtime.ticketPrice) ||
+      showtime.ticketPrice < 0 ||
+      showtime.availableSeats < 0 ||
+      showtime.availableSeats > showtime.totalSeats
+    ) {
+      return res.status(409).json({
+        message: "This showtime has inconsistent screen or pricing details.",
+      });
+    }
+
+    // Validate seat syntax and that each seat exists in the configured screen layout.
     const seats = normalizeSeats(rawSeats);
     if (typeof seats === "string") {
       return res.status(400).json({ message: seats });
+    }
+
+    const invalidSeat = validateSeatsAgainstScreen(seats, screen);
+    if (invalidSeat) {
+      return res.status(400).json({
+        message: `Seat ${invalidSeat} does not exist on this screen.`,
+      });
     }
 
     if (seats.length > showtime.availableSeats) {
@@ -128,9 +244,17 @@ export const createBooking = async (req: Request, res: Response) => {
     }
 
     if (!userId) {
-      if (!guestInfo || !guestInfo.name || !guestInfo.email || !guestInfo.phone) {
+      if (
+        !guestInfo ||
+        typeof guestInfo.name !== "string" ||
+        !guestInfo.name.trim() ||
+        typeof guestInfo.email !== "string" ||
+        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(guestInfo.email.trim()) ||
+        typeof guestInfo.phone !== "string" ||
+        !guestInfo.phone.trim()
+      ) {
         return res.status(400).json({
-          message: "Guest name, email and phone are required!",
+          message: "Guest name, valid email and phone are required!",
         });
       }
     }
@@ -138,14 +262,34 @@ export const createBooking = async (req: Request, res: Response) => {
     // 4. Calculate ticket amount
     const totalSeats = seats.length;
     const ticketPrice = showtime.ticketPrice;
-    const ticketTotal = totalSeats * ticketPrice;
+    const ticketTotal = Math.round(totalSeats * ticketPrice * 100) / 100;
 
     // 5. Process Food Items
-    let processedFoodItems: any[] = [];
+    if (foodItems !== undefined && !Array.isArray(foodItems)) {
+      return res.status(400).json({ message: "Food items must be a list!" });
+    }
+
+    let processedFoodItems: {
+      food: Types.ObjectId;
+      quantity: number;
+      price: number;
+    }[] = [];
     let foodTotal = 0;
 
-    if (foodItems && foodItems.length > 0) {
+    if (foodItems?.length > 0) {
       for (const item of foodItems) {
+        if (
+          !item ||
+          typeof item.foodId !== "string" ||
+          !Types.ObjectId.isValid(item.foodId) ||
+          !Number.isSafeInteger(item.quantity ?? 1) ||
+          (item.quantity ?? 1) < 1
+        ) {
+          return res.status(400).json({
+            message: "Each food item needs a valid id and positive quantity!",
+          });
+        }
+
         const food = await Food.findById(item.foodId);
 
         if (!food) {
@@ -160,12 +304,18 @@ export const createBooking = async (req: Request, res: Response) => {
           });
         }
 
-        const quantity = item.quantity || 1;
+        const quantity = item.quantity ?? 1;
         const itemTotal = food.price * quantity;
+        if (
+          !Number.isFinite(food.price) ||
+          food.price < 0 ||
+          !Number.isFinite(itemTotal)
+        ) {
+          return res.status(400).json({ message: "Invalid food item total!" });
+        }
 
         processedFoodItems.push({
           food: food._id,
-          name: food.name,
           quantity,
           price: food.price,
         });
@@ -173,18 +323,35 @@ export const createBooking = async (req: Request, res: Response) => {
         foodTotal += itemTotal;
       }
     }
+    foodTotal = Math.round(foodTotal * 100) / 100;
 
     // 6. Calculate subtotal (before discount)
-    const subTotal = ticketTotal + foodTotal;
+    const subTotal = Math.round((ticketTotal + foodTotal) * 100) / 100;
+    if (!Number.isFinite(subTotal)) {
+      return res.status(400).json({ message: "Invalid booking total!" });
+    }
 
     // 7. Process Offer / Promo Code
     let discountAmount = 0;
     let appliedOffer: Types.ObjectId | undefined;
-    let offerToCount: Types.ObjectId | undefined; // usedCount is increased only after the booking is saved
+    let offerSnapshot:
+      | {
+          discountType: "percentage" | "fixed";
+          discountValue: number;
+          minAmount?: number;
+          maxDiscount?: number;
+          validFrom: Date;
+          validTo: Date;
+          usageLimit?: number;
+        }
+      | undefined;
 
     if (offerCode) {
+      if (typeof offerCode !== "string" || !offerCode.trim()) {
+        return res.status(400).json({ message: "Invalid offer code!" });
+      }
       const offer = await Offer.findOne({
-        code: offerCode.toUpperCase(),
+        code: offerCode.trim().toUpperCase(),
         isActive: true,
       });
 
@@ -197,6 +364,18 @@ export const createBooking = async (req: Request, res: Response) => {
         return res.status(400).json({
           message: "This offer is not valid at the moment!",
         });
+      }
+
+      if (!Number.isFinite(offer.discountValue) || offer.discountValue < 0) {
+        return res.status(409).json({ message: "This offer has invalid discount details!" });
+      }
+      if (
+        (offer.minAmount !== undefined &&
+          (!Number.isFinite(offer.minAmount) || offer.minAmount < 0)) ||
+        (offer.maxDiscount !== undefined &&
+          (!Number.isFinite(offer.maxDiscount) || offer.maxDiscount < 0))
+      ) {
+        return res.status(409).json({ message: "This offer has invalid discount details!" });
       }
 
       if (offer.usageLimit && offer.usedCount >= offer.usageLimit) {
@@ -213,7 +392,7 @@ export const createBooking = async (req: Request, res: Response) => {
 
       // Calculate discount
       if (offer.discountType === "percentage") {
-        discountAmount = (subTotal * offer.discountValue) / 100;
+        discountAmount = Math.round((subTotal * offer.discountValue) / 100 * 100) / 100;
 
         if (offer.maxDiscount && discountAmount > offer.maxDiscount) {
           discountAmount = offer.maxDiscount;
@@ -225,13 +404,27 @@ export const createBooking = async (req: Request, res: Response) => {
       if (discountAmount > subTotal) {
         discountAmount = subTotal;
       }
+      discountAmount = Math.round(discountAmount * 100) / 100;
 
       appliedOffer = offer._id;
-      offerToCount = offer._id;
+      offerSnapshot = {
+        discountType: offer.discountType,
+        discountValue: offer.discountValue,
+        minAmount: offer.minAmount,
+        maxDiscount: offer.maxDiscount,
+        validFrom: offer.validFrom,
+        validTo: offer.validTo,
+        usageLimit: offer.usageLimit,
+      };
     }
 
     // 8. Final amount
-    const finalAmount = subTotal - discountAmount;
+    const finalAmount = Math.round((subTotal - discountAmount) * 100) / 100;
+    if (!Number.isFinite(finalAmount) || finalAmount <= 0) {
+      return res.status(400).json({
+        message: "The booking total must be greater than zero to use online payment.",
+      });
+    }
 
     // 9. Generate unique booking code
     let bookingCode = generateBookingCode();
@@ -241,55 +434,148 @@ export const createBooking = async (req: Request, res: Response) => {
       existing = await Booking.findOne({ bookingCode });
     }
 
-    // 10. Create booking
-    // The unique index (showtime + seats.seatId) makes this insert atomic: if another request
-    // booked the same seat a moment ago, MongoDB throws E11000 and nothing is saved.
-    let booking;
-    try {
-      booking = await Booking.create({
-        bookingCode,
-        user: userId,
-        guestInfo: userId ? undefined : guestInfo,
-        showtime: showtime._id,
-        movie: showtime.movie,
-        cinema: showtime.cinema,
-        screen: showtime.screen,
-        seats,
-        totalSeats,
-        ticketPrice,
-        totalAmount: subTotal,
-        foodItems: processedFoodItems,
-        foodTotal,
-        offer: appliedOffer,
-        discountAmount,
-        finalAmount,
-        paymentStatus: "Pending",
-        bookingStatus: "Confirmed",
-      });
-    } catch (err: any) {
-      if (err?.code === 11000 && err?.keyPattern?.["seats.seatId"]) {
-        const nowTaken = await findUnavailableSeatIds(
-          showtime._id,
-          seats.map((s) => s.seatId)
+    const paymentToken = generatePaymentToken();
+    const holdExpiresAt = computeHoldExpiry();
+    const bookingData = {
+      bookingCode,
+      user: userId,
+      guestInfo: userId ? undefined : guestInfo,
+      showtime: showtime._id,
+      movie: showtime.movie,
+      cinema: showtime.cinema,
+      screen: showtime.screen,
+      seats,
+      totalSeats,
+      ticketPrice,
+      totalAmount: subTotal,
+      foodItems: processedFoodItems,
+      foodTotal,
+      offer: appliedOffer,
+      discountAmount,
+      finalAmount,
+      paymentStatus: "Pending" as const,
+      bookingStatus: "Pending" as const,
+      holdExpiresAt,
+      paymentTokenHash: paymentToken.hash,
+    };
+
+    const persistBooking = async (
+      session?: mongoose.ClientSession
+    ): Promise<InstanceType<typeof Booking>> => {
+      let seatsReserved = false;
+      let offerReserved = false;
+      const options = session ? { session } : {};
+
+      try {
+        const seatReservation = await Showtime.updateOne(
+          {
+            _id: showtime._id,
+            movie: showtime.movie,
+            cinema: showtime.cinema,
+            screen: showtime.screen,
+            totalSeats: screen.totalSeats,
+            ticketPrice,
+            isActive: true,
+            availableSeats: { $gte: totalSeats },
+          },
+          { $inc: { availableSeats: -totalSeats } },
+          options
         );
-        const ids = nowTaken.length > 0 ? nowTaken : seats.map((s) => s.seatId);
-        return res.status(409).json({
-          message: seatConflictMessage(ids),
-          unavailableSeats: ids,
-        });
+        if (seatReservation.modifiedCount !== 1) {
+          throw new BookingFlowError(
+            "The selected seats are no longer available. Please choose again.",
+            409
+          );
+        }
+        seatsReserved = true;
+
+        if (appliedOffer && offerSnapshot) {
+          const offerFilter: Record<string, unknown> = {
+            _id: appliedOffer,
+            isActive: true,
+            validFrom: { $lte: new Date() },
+            validTo: { $gte: new Date() },
+            discountType: offerSnapshot.discountType,
+            discountValue: offerSnapshot.discountValue,
+            usedCount: offerSnapshot.usageLimit
+              ? { $lt: offerSnapshot.usageLimit }
+              : { $gte: 0 },
+          };
+          if (offerSnapshot.minAmount !== undefined) {
+            offerFilter.minAmount = offerSnapshot.minAmount;
+          }
+          if (offerSnapshot.maxDiscount !== undefined) {
+            offerFilter.maxDiscount = offerSnapshot.maxDiscount;
+          }
+          const offerReservation = await Offer.updateOne(
+            offerFilter,
+            { $inc: { usedCount: 1 } },
+            options
+          );
+          if (offerReservation.modifiedCount !== 1) {
+            throw new BookingFlowError(
+              "This offer is no longer available. Please try again.",
+              409
+            );
+          }
+          offerReserved = true;
+        }
+
+        const booking = new Booking(bookingData);
+        if (session) await booking.save({ session });
+        else await booking.save();
+        return booking;
+      } catch (error) {
+        if (!session) {
+          const compensation: Promise<unknown>[] = [];
+          if (offerReserved && appliedOffer) {
+            compensation.push(
+              Offer.updateOne(
+                { _id: appliedOffer, usedCount: { $gt: 0 } },
+                { $inc: { usedCount: -1 } }
+              )
+            );
+          }
+          if (seatsReserved) {
+            compensation.push(
+              Showtime.updateOne(
+                { _id: showtime._id },
+                { $inc: { availableSeats: totalSeats } }
+              )
+            );
+          }
+          const results = await Promise.allSettled(compensation);
+          const compensationErrors = results
+            .filter(
+              (result): result is PromiseRejectedResult =>
+                result.status === "rejected"
+            )
+            .map((result) => result.reason);
+          if (compensationErrors.length) {
+            console.error("Booking reservation rollback failed:", compensationErrors);
+          }
+        }
+        throw error;
       }
-      throw err; // handled by the outer catch (500)
+    };
+
+    let booking: InstanceType<typeof Booking> | undefined;
+    const session = await mongoose.startSession();
+    try {
+      try {
+        await session.withTransaction(async () => {
+          booking = await persistBooking(session);
+        });
+      } catch (error) {
+        if (!isTransactionUnsupported(error)) throw error;
+        booking = await persistBooking();
+      }
+    } finally {
+      await session.endSession();
     }
 
-    // 11. Side effects, only after the booking is safely saved
-    // Atomic decrement (instead of read-modify-write) so concurrent bookings cannot overwrite each other
-    await Showtime.updateOne(
-      { _id: showtime._id },
-      { $inc: { availableSeats: -totalSeats } }
-    );
-
-    if (offerToCount) {
-      await Offer.updateOne({ _id: offerToCount }, { $inc: { usedCount: 1 } });
+    if (!booking) {
+      throw new Error("Booking transaction completed without creating a booking");
     }
 
     // 12. Return populated booking
@@ -303,8 +589,33 @@ export const createBooking = async (req: Request, res: Response) => {
     res.status(201).json({
       message: "Booking created successfully!",
       data: populatedBooking,
+      paymentToken: paymentToken.token,
     });
   } catch (error) {
+    if (error instanceof BookingFlowError) {
+      return res.status(error.statusCode).json({
+        message: error.message,
+        ...error.responseData,
+      });
+    }
+    if (isDuplicateSeatError(error)) {
+      const seats = Array.isArray(req.body?.seats)
+        ? normalizeSeats(req.body.seats)
+        : [];
+      const seatIds =
+        typeof seats === "string" ? [] : seats.map((seat) => seat.seatId);
+      if (seatIds.length && Types.ObjectId.isValid(req.body?.showtimeId)) {
+        const nowTaken = await findUnavailableSeatIds(
+          new Types.ObjectId(req.body.showtimeId),
+          seatIds
+        );
+        const ids = nowTaken.length > 0 ? nowTaken : seatIds;
+        return res.status(409).json({
+          message: seatConflictMessage(ids),
+          unavailableSeats: ids,
+        });
+      }
+    }
     console.error("CreateBooking Error:", error);
     res.status(500).json({ message: "Failed to create booking!" });
   }
@@ -418,20 +729,39 @@ export const cancelBooking = async (req: AuthRequest, res: Response) => {
       });
     }
 
-    // Release seats back to showtime
-    const showtime = await Showtime.findById(booking.showtime);
-    if (showtime) {
-      showtime.availableSeats += booking.totalSeats;
-      await showtime.save();
+    const previousStatus = booking.bookingStatus;
+    const cancelledBooking = await Booking.findOneAndUpdate(
+      { _id: booking._id, bookingStatus: previousStatus },
+      {
+        $set: {
+          bookingStatus: "Cancelled",
+          paymentStatus: previousStatus === "Pending" ? "Cancelled" : "Refunded",
+          holdExpiresAt: null,
+          paymentTokenHash: null,
+        },
+      },
+      { new: true }
+    );
+    if (!cancelledBooking) {
+      return res.status(409).json({
+        message: "Booking status changed. Please refresh and try again.",
+      });
     }
 
-    booking.bookingStatus = "Cancelled";
-    booking.paymentStatus = "Refunded";
-    await booking.save();
+    await Showtime.updateOne(
+      { _id: booking.showtime },
+      { $inc: { availableSeats: booking.totalSeats } }
+    );
+    if (booking.offer) {
+      await Offer.updateOne(
+        { _id: booking.offer, usedCount: { $gt: 0 } },
+        { $inc: { usedCount: -1 } }
+      );
+    }
 
     res.status(200).json({
       message: "Booking cancelled successfully!",
-      data: booking,
+      data: cancelledBooking,
     });
   } catch (error) {
     console.error("CancelBooking Error:", error);
