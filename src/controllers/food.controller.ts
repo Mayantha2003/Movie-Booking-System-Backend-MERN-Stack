@@ -1,14 +1,25 @@
 import { Request, Response } from "express";
 import { Food } from "../models/food.model";
+import {
+  adminInputErrorStatus,
+  isValidAdminObjectId,
+  validateFoodInput,
+} from "../utils/adminCrudInput";
+import { isValidRequestObjectId, parseOptionalQueryString } from "../utils/requestValidation";
 
 // ===================== GET ALL FOODS =====================
 export const getAllFoods = async (req: Request, res: Response) => {
-  try {
-    const { category } = req.query;
+  const parsedCategory = parseOptionalQueryString(req.query.category);
+  const allowedCategories = ["Popcorn", "Drinks", "Snacks", "Combos", "Other"];
+  if (!parsedCategory.valid ||
+      (parsedCategory.value && !allowedCategories.includes(parsedCategory.value))) {
+    return res.status(400).json({ message: "Invalid food category." });
+  }
 
+  try {
     const filter: any = { isAvailable: true };
-    if (category) {
-      filter.category = category;
+    if (parsedCategory.value) {
+      filter.category = parsedCategory.value;
     }
 
     const foods = await Food.find(filter).sort({ category: 1, name: 1 });
@@ -26,6 +37,10 @@ export const getAllFoods = async (req: Request, res: Response) => {
 
 // ===================== GET FOOD BY ID =====================
 export const getFoodById = async (req: Request, res: Response) => {
+  if (!isValidRequestObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid food id." });
+  }
+
   try {
     const food = await Food.findById(req.params.id);
 
@@ -45,38 +60,32 @@ export const getFoodById = async (req: Request, res: Response) => {
 
 // ===================== CREATE FOOD (Admin) =====================
 export const createFood = async (req: Request, res: Response) => {
+  const input = validateFoodInput(req.body, true);
+  if (typeof input === "string") return res.status(400).json({ message: input });
+
   try {
-    const { name, description, category, price, image, isVegetarian } = req.body;
-
-    if (!name || !category || price === undefined) {
-      return res.status(400).json({
-        message: "Name, category and price are required!",
-      });
-    }
-
-    const food = await Food.create({
-      name,
-      description,
-      category,
-      price,
-      image,
-      isVegetarian: isVegetarian || false,
-    });
+    const food = await Food.create(input);
 
     res.status(201).json({
       message: "Food created successfully!",
       data: food,
     });
   } catch (error) {
-    console.error("CreateFood Error:", error);
-    res.status(500).json({ message: "Failed to create food!" });
+    const status = adminInputErrorStatus(error);
+    res.status(status).json({ message: status === 400 ? "Food data is invalid." : "Failed to create food!" });
   }
 };
 
 // ===================== UPDATE FOOD (Admin) =====================
 export const updateFood = async (req: Request, res: Response) => {
+  if (!isValidAdminObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid food id." });
+  }
+  const input = validateFoodInput(req.body, false);
+  if (typeof input === "string") return res.status(400).json({ message: input });
+
   try {
-    const food = await Food.findByIdAndUpdate(req.params.id, req.body, {
+    const food = await Food.findByIdAndUpdate(req.params.id, { $set: input }, {
       new: true,
       runValidators: true,
     });
@@ -90,13 +99,17 @@ export const updateFood = async (req: Request, res: Response) => {
       data: food,
     });
   } catch (error) {
-    console.error("UpdateFood Error:", error);
-    res.status(500).json({ message: "Failed to update food!" });
+    const status = adminInputErrorStatus(error);
+    res.status(status).json({ message: status === 400 ? "Food data is invalid." : "Failed to update food!" });
   }
 };
 
 // ===================== DELETE FOOD (Admin) =====================
 export const deleteFood = async (req: Request, res: Response) => {
+  if (!isValidRequestObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid food id." });
+  }
+
   try {
     const food = await Food.findByIdAndDelete(req.params.id);
 
@@ -115,6 +128,10 @@ export const deleteFood = async (req: Request, res: Response) => {
 
 // ===================== TOGGLE AVAILABILITY (Admin) =====================
 export const toggleFoodAvailability = async (req: Request, res: Response) => {
+  if (!isValidRequestObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid food id." });
+  }
+
   try {
     const food = await Food.findById(req.params.id);
 

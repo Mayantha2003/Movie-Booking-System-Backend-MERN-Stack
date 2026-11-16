@@ -7,6 +7,7 @@ import {
   getMyDetails,
   getRefreshToken,
   createAdmin,
+  logout,
 } from "../controllers/auth.controller";
 
 import { authenticate } from "../middleware/auth";
@@ -19,6 +20,7 @@ const router = Router();
 router.post("/register", register);
 router.post("/login", login);
 router.post("/refresh", getRefreshToken);
+router.post("/logout", logout);
 
 // Super Admin only
 router.post(

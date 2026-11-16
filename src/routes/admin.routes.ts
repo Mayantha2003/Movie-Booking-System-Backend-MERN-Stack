@@ -1,6 +1,7 @@
 import { Router } from "express";
 import {
   getStats,
+  getAnalytics,
   getAllMovies,
   getAllFoods,
   getAllOffers,
@@ -23,11 +24,13 @@ router.get("/stats", getStats);
 router.get("/movies", getAllMovies);
 router.get("/foods", getAllFoods);
 router.get("/offers", getAllOffers);
+router.get("/stats", getStats);
 
 router.get("/users", getUsers);
 router.post("/users", createUser);
 router.put("/users/:id", updateUser);
 router.patch("/users/:id/status", updateUserStatus);
 router.delete("/users/:id", deleteUser);
+router.get("/analytics", getAnalytics);
 
 export default router;

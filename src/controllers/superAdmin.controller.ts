@@ -1,11 +1,10 @@
 import { Response } from "express";
-import mongoose from "mongoose";
 import { AuthRequest } from "../middleware/auth";
 import { UserModel, UserRole, UserStatus } from "../models/user.model";
 import { MovieModel } from "../models/movie.model";
 import { Booking } from "../models/booking.model";
+import { isValidRequestObjectId } from "../utils/requestValidation";
 
-const isValidId = (id: string) => mongoose.Types.ObjectId.isValid(id);
 
 // ===================== DASHBOARD STATS =====================
 export const getStats = async (_req: AuthRequest, res: Response) => {
@@ -53,7 +52,7 @@ export const updateAdminStatus = async (req: AuthRequest, res: Response) => {
     const id = String(req.params.id);
     const { status } = req.body;
 
-    if (!isValidId(id)) {
+    if (!isValidRequestObjectId(id)) {
       return res.status(400).json({ message: "Invalid admin id!" });
     }
     if (![UserStatus.ACTIVE, UserStatus.BLOCKED].includes(status)) {
@@ -89,7 +88,7 @@ export const deleteAdmin = async (req: AuthRequest, res: Response) => {
   try {
     const id = String(req.params.id);
 
-    if (!isValidId(id)) {
+    if (!isValidRequestObjectId(id)) {
       return res.status(400).json({ message: "Invalid admin id!" });
     }
 

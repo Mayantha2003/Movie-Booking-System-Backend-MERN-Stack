@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
 import mongoose, { Types } from "mongoose";
-import { createBooking } from "../src/controllers/booking.controller";
+import {
+  createBooking,
+  cancelBooking,
+  getBookingByCode,
+} from "../src/controllers/booking.controller";
 import { Booking } from "../src/models/booking.model";
 import { Cinema } from "../src/models/cinema.model";
 import { MovieModel } from "../src/models/movie.model";
@@ -9,6 +13,10 @@ import { Offer } from "../src/models/offer.model";
 import { Screen } from "../src/models/screen.model";
 import { Showtime } from "../src/models/showtime.model";
 import { releaseExpiredHolds, hashPaymentToken } from "../src/services/bookingHold.service";
+import {
+  generateBookingCode,
+  normalizeBookingCode,
+} from "../src/utils/bookingCode";
 
 const query = <T>(value: T) => {
   const result: any = {
@@ -132,6 +140,247 @@ const setupBookingMocks = (
 
   return { showtimeId, saved, seatUpdates };
 };
+
+test("generates secure-format booking codes and accepts legacy codes", () => {
+  const code = generateBookingCode();
+
+  assert.match(code, /^BK-[A-HJ-NP-Z2-9]{26}$/);
+  assert.equal(normalizeBookingCode("bk-abc234"), "BK-ABC234");
+  assert.equal(normalizeBookingCode(code.toLowerCase()), code);
+  assert.equal(normalizeBookingCode("BK-INVALID!"), null);
+});
+
+test("legacy guest lookup requires matching contact details and excludes them from its response", async (t) => {
+  const booking = {
+    bookingCode: "BK-ABC234",
+    guestInfo: {
+      name: "Test User",
+      email: "private@example.test",
+      phone: "0770000000",
+    },
+    movie: { title: "Test Movie", poster: "/poster.png", duration: 100 },
+    cinema: { name: "Test Cinema", address: "Test Address" },
+    screen: { name: "Screen 1", screenType: "Standard" },
+    showtime: {
+      showDate: "2026-01-01",
+      startTime: "18:00",
+      ticketPrice: 1250,
+    },
+    seats: [{ row: "A", seatNumber: 1, seatId: "A-1" }],
+    totalSeats: 1,
+    ticketPrice: 1250,
+    totalAmount: 1250,
+    foodTotal: 0,
+    discountAmount: 0,
+    offer: null,
+    finalAmount: 1250,
+    paymentStatus: "Paid",
+    bookingStatus: "Confirmed",
+    user: null,
+    paymentTokenHash: "must-not-be-returned",
+  };
+  const filters: unknown[] = [];
+
+  replace(t, Booking, "findOne", (filter: unknown) => {
+    filters.push(filter);
+    return query(booking);
+  });
+
+  const legacyResponse = response();
+  await getBookingByCode({
+    method: "POST",
+    params: { code: "bk-abc234" },
+    body: { email: "PRIVATE@example.test", phone: "0770000000" },
+  } as any, legacyResponse);
+
+  assert.equal(legacyResponse.statusCode, 200);
+  assert.deepEqual(filters[0], { bookingCode: "BK-ABC234" });
+  assert.deepEqual(legacyResponse.body.data.guestInfo, { name: "Test User" });
+  assert.deepEqual(legacyResponse.body.data.seats, [{ seatId: "A-1" }]);
+  assert.deepEqual(Object.keys(legacyResponse.body.data).sort(), [
+    "bookingCode",
+    "bookingStatus",
+    "cinema",
+    "discountAmount",
+    "finalAmount",
+    "foodTotal",
+    "guestInfo",
+    "movie",
+    "offer",
+    "paymentStatus",
+    "screen",
+    "seats",
+    "showtime",
+    "ticketPrice",
+    "totalSeats",
+  ]);
+  assert.equal("email" in legacyResponse.body.data.guestInfo, false);
+  assert.equal("phone" in legacyResponse.body.data.guestInfo, false);
+  assert.equal("user" in legacyResponse.body.data, false);
+  assert.equal("paymentTokenHash" in legacyResponse.body.data, false);
+
+  const unauthorizedLegacyResponse = response();
+  await getBookingByCode({
+    method: "GET",
+    params: { code: "BK-ABC234" },
+  } as any, unauthorizedLegacyResponse);
+  assert.equal(unauthorizedLegacyResponse.statusCode, 404);
+
+  const wrongContactResponse = response();
+  await getBookingByCode({
+    method: "POST",
+    params: { code: "BK-ABC234" },
+    body: { email: "wrong@example.test", phone: "0770000000" },
+  } as any, wrongContactResponse);
+  assert.equal(wrongContactResponse.statusCode, 404);
+
+  const secureCode = generateBookingCode();
+  const secureResponse = response();
+  await getBookingByCode({
+    method: "GET",
+    params: { code: secureCode },
+  } as any, secureResponse);
+
+  assert.equal(secureResponse.statusCode, 200);
+  assert.deepEqual(filters.at(-1), { bookingCode: secureCode });
+});
+
+test("legacy account bookings require the authenticated account owner", async (t) => {
+  const accountId = new Types.ObjectId();
+  const booking = {
+    bookingCode: "BK-ABC234",
+    user: accountId,
+    guestInfo: undefined,
+    movie: { title: "Test Movie", poster: "/poster.png", duration: 100 },
+    cinema: { name: "Test Cinema", address: "Test Address" },
+    screen: { name: "Screen 1", screenType: "Standard" },
+    showtime: { showDate: "2026-01-01", startTime: "18:00" },
+    seats: [{ seatId: "A-1" }],
+    totalSeats: 1,
+    ticketPrice: 1250,
+    paymentStatus: "Paid",
+    bookingStatus: "Confirmed",
+    finalAmount: 1250,
+  };
+  replace(t, Booking, "findOne", () => query(booking));
+
+  const ownerResponse = response();
+  await getBookingByCode({
+    method: "GET",
+    params: { code: "BK-ABC234" },
+    user: { sub: accountId.toString() },
+  } as any, ownerResponse);
+  assert.equal(ownerResponse.statusCode, 200);
+
+  const otherUserResponse = response();
+  await getBookingByCode({
+    method: "GET",
+    params: { code: "BK-ABC234" },
+    user: { sub: new Types.ObjectId().toString() },
+  } as any, otherUserResponse);
+  assert.equal(otherUserResponse.statusCode, 404);
+});
+
+test("public booking lookup uses the same not-found response for invalid and unknown codes", async (t) => {
+  let lookupCount = 0;
+  replace(t, Booking, "findOne", () => {
+    lookupCount += 1;
+    return query(null);
+  });
+
+  const invalidResponse = response();
+  await getBookingByCode({ params: { code: "not-a-booking-code" } } as any, invalidResponse);
+  const unknownResponse = response();
+  await getBookingByCode({ params: { code: "BK-ZZZZZZ" } } as any, unknownResponse);
+
+  assert.equal(invalidResponse.statusCode, 404);
+  assert.deepEqual(invalidResponse.body, unknownResponse.body);
+  assert.equal(lookupCount, 1);
+});
+
+test("cancelling an unpaid pending booking preserves cancellation and seat release behavior", async (t) => {
+  const booking = {
+    _id: new Types.ObjectId(),
+    user: new Types.ObjectId(),
+    bookingStatus: "Pending",
+    paymentStatus: "Pending",
+    showtime: new Types.ObjectId(),
+    totalSeats: 2,
+    offer: new Types.ObjectId(),
+  };
+  let bookingUpdate: any;
+  const seatUpdates: unknown[] = [];
+  const offerUpdates: unknown[] = [];
+
+  replace(t, Booking, "findById", async () => booking);
+  replace(
+    t,
+    Booking,
+    "findOneAndUpdate",
+    async (_filter: unknown, update: any) => {
+      bookingUpdate = update;
+      return { ...booking, ...update.$set };
+    }
+  );
+  replace(t, Showtime, "updateOne", async (_filter: unknown, update: unknown) => {
+    seatUpdates.push(update);
+  });
+  replace(t, Offer, "updateOne", async (_filter: unknown, update: unknown) => {
+    offerUpdates.push(update);
+  });
+
+  const res = response();
+  await cancelBooking(
+    { params: { id: booking._id.toString() }, user: { sub: booking.user.toString() } } as any,
+    res
+  );
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(bookingUpdate.$set.bookingStatus, "Cancelled");
+  assert.equal(bookingUpdate.$set.paymentStatus, "Cancelled");
+  assert.deepEqual(seatUpdates[0], { $inc: { availableSeats: 2 } });
+  assert.deepEqual(offerUpdates[0], { $inc: { usedCount: -1 } });
+});
+
+test("cancelling a paid booking keeps payment status Paid pending genuine refund confirmation", async (t) => {
+  const booking = {
+    _id: new Types.ObjectId(),
+    user: new Types.ObjectId(),
+    bookingStatus: "Confirmed",
+    paymentStatus: "Paid",
+    showtime: new Types.ObjectId(),
+    totalSeats: 1,
+    offer: null,
+  };
+  let bookingUpdate: any;
+  const seatUpdates: unknown[] = [];
+
+  replace(t, Booking, "findById", async () => booking);
+  replace(
+    t,
+    Booking,
+    "findOneAndUpdate",
+    async (_filter: unknown, update: any) => {
+      bookingUpdate = update;
+      return { ...booking, ...update.$set };
+    }
+  );
+  replace(t, Showtime, "updateOne", async (_filter: unknown, update: unknown) => {
+    seatUpdates.push(update);
+  });
+
+  const res = response();
+  await cancelBooking(
+    { params: { id: booking._id.toString() }, user: { sub: booking.user.toString() } } as any,
+    res
+  );
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(bookingUpdate.$set.bookingStatus, "Cancelled");
+  assert.equal(bookingUpdate.$set.paymentStatus, "Paid");
+  assert.equal(res.body.data.paymentStatus, "Paid");
+  assert.deepEqual(seatUpdates[0], { $inc: { availableSeats: 1 } });
+});
 
 test("creates a Pending booking, reserves seats, and returns the raw token once", async (t) => {
   const { showtimeId, saved, seatUpdates } = setupBookingMocks(t);

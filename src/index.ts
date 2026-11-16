@@ -13,6 +13,7 @@ import "./models/showtime.model";
 import "./models/booking.model";
 import "./models/food.model";
 import "./models/offer.model";
+import "./models/revokedToken.model";
 
 // =====================================================================
 
@@ -27,6 +28,7 @@ import offerRoutes from "./routes/offer.routes";
 import adminRoutes from "./routes/admin.routes";
 import superAdminRoutes from "./routes/superAdmin.routes";
 import paymentRoutes from "./routes/payment.routes";
+import recommendationRoutes from "./routes/recommendation.routes";
 import { startHoldSweeper } from "./services/bookingHold.service";
 
 dotenv.config();
@@ -35,6 +37,7 @@ const app = express();
 const PORT = process.env.PORT || 5001;
 
 // Middleware
+app.set("trust proxy", 1);
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 app.use(cookieParser());
@@ -63,6 +66,7 @@ app.use("/api/foods",foodRoutes);
 app.use("/api/offers", offerRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/super-admin", superAdminRoutes);
+app.use("/api/recommendations", recommendationRoutes);
 
 // Test Route
 app.get("/", (req, res) => {

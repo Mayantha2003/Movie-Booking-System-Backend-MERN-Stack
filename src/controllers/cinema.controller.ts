@@ -1,30 +1,51 @@
 import { Request, Response } from "express";
 import { Cinema } from "../models/cinema.model";
 import { Screen } from "../models/screen.model";
+import {
+  adminInputErrorStatus,
+  isValidAdminObjectId,
+  validateCinemaInput,
+} from "../utils/adminCrudInput";
+import {
+  isValidRequestObjectId,
+  parseOptionalQueryBoolean,
+  parseOptionalQueryString,
+} from "../utils/requestValidation";
 
 // ===================== CREATE CINEMA =====================
 export const createCinema = async (req: Request, res: Response) => {
+  const input = validateCinemaInput(req.body, true);
+  if (typeof input === "string") return res.status(400).json({ message: input });
+
   try {
-    const cinema = await Cinema.create(req.body);
+    const cinema = await Cinema.create(input);
 
     res.status(201).json({
       message: "Cinema created successfully!",
       data: cinema,
     });
   } catch (error) {
-    console.error("CreateCinema Error:", error);
-    res.status(500).json({ message: "Failed to create cinema!" });
+    const status = adminInputErrorStatus(error);
+    res.status(status).json({
+      message: status === 409 ? "A cinema with these unique details already exists."
+        : status === 400 ? "Cinema data is invalid."
+          : "Failed to create cinema!",
+    });
   }
 };
 
 // ===================== GET ALL CINEMAS =====================
 export const getAllCinemas = async (req: Request, res: Response) => {
-  try {
-    const { city, isActive } = req.query;
+  const parsedCity = parseOptionalQueryString(req.query.city);
+  const parsedIsActive = parseOptionalQueryBoolean(req.query.isActive);
+  if (!parsedCity.valid || !parsedIsActive.valid) {
+    return res.status(400).json({ message: "Invalid cinema query parameters." });
+  }
 
+  try {
     const filter: any = {};
-    if (city) filter.city = { $regex: city as string, $options: "i" };
-    if (isActive !== undefined) filter.isActive = isActive === "true";
+    if (parsedCity.value) filter.city = { $regex: parsedCity.value, $options: "i" };
+    if (parsedIsActive.value !== undefined) filter.isActive = parsedIsActive.value;
 
     const cinemas = await Cinema.find(filter).sort({ name: 1 });
 
@@ -41,6 +62,10 @@ export const getAllCinemas = async (req: Request, res: Response) => {
 
 // ===================== GET SINGLE CINEMA =====================
 export const getCinemaById = async (req: Request, res: Response) => {
+  if (!isValidRequestObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid cinema id." });
+  }
+
   try {
     const cinema = await Cinema.findById(req.params.id);
 
@@ -60,8 +85,14 @@ export const getCinemaById = async (req: Request, res: Response) => {
 
 // ===================== UPDATE CINEMA =====================
 export const updateCinema = async (req: Request, res: Response) => {
+  if (!isValidAdminObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid cinema id." });
+  }
+  const input = validateCinemaInput(req.body, false);
+  if (typeof input === "string") return res.status(400).json({ message: input });
+
   try {
-    const cinema = await Cinema.findByIdAndUpdate(req.params.id, req.body, {
+    const cinema = await Cinema.findByIdAndUpdate(req.params.id, { $set: input }, {
       new: true,
       runValidators: true,
     });
@@ -75,13 +106,21 @@ export const updateCinema = async (req: Request, res: Response) => {
       data: cinema,
     });
   } catch (error) {
-    console.error("UpdateCinema Error:", error);
-    res.status(500).json({ message: "Failed to update cinema!" });
+    const status = adminInputErrorStatus(error);
+    res.status(status).json({
+      message: status === 409 ? "A cinema with these unique details already exists."
+        : status === 400 ? "Cinema data is invalid."
+          : "Failed to update cinema!",
+    });
   }
 };
 
 // ===================== DELETE CINEMA =====================
 export const deleteCinema = async (req: Request, res: Response) => {
+  if (!isValidRequestObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid cinema id." });
+  }
+
   try {
     const cinema = await Cinema.findByIdAndDelete(req.params.id);
 
@@ -102,6 +141,10 @@ export const deleteCinema = async (req: Request, res: Response) => {
 
 // ===================== GET SCREENS BY CINEMA =====================
 export const getScreensByCinema = async (req: Request, res: Response) => {
+  if (!isValidRequestObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid cinema id." });
+  }
+
   try {
     const screens = await Screen.find({
       cinema: req.params.id,

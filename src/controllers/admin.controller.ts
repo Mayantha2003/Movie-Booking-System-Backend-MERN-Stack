@@ -4,8 +4,12 @@ import { Food } from "../models/food.model";
 import { Offer } from "../models/offer.model";
 import { Request, Response } from "express";
 import bcrypt from "bcryptjs";
-import mongoose from "mongoose";
 import { UserModel, UserRole, UserStatus } from "../models/user.model";
+import {
+  emailDuplicateFilter,
+  validateAccountInput,
+} from "../utils/accountInput";
+import { isValidRequestObjectId } from "../utils/requestValidation";
 
 // ===================== DASHBOARD STATS =====================
 export const getStats = async (_req: Request, res: Response) => {
@@ -79,7 +83,6 @@ export const getAllOffers = async (_req: Request, res: Response) => {
 const CUSTOMER_ROLES = [UserRole.USER, UserRole.CUSTOMER];
 const SAFE_FIELDS = "-password -verification_token";
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const isValidId = (id: string) => mongoose.Types.ObjectId.isValid(id);
 
 // ----- LIST USERS (with booking count and total paid) -----
 export const getUsers = async (_req: Request, res: Response) => {
@@ -118,33 +121,26 @@ export const getUsers = async (_req: Request, res: Response) => {
 
 // ----- CREATE USER -----
 export const createUser = async (req: Request, res: Response) => {
+  const input = validateAccountInput(req.body);
+  if (typeof input === "string") {
+    return res.status(400).json({ message: input });
+  }
+
   try {
-    const { first_name, last_name, username, email, phone, password } = req.body;
-
-    if (!first_name || !last_name || !username || !password) {
-      return res.status(400).json({ message: "Required fields are missing!" });
-    }
-    if (String(password).length < 8) {
-      return res.status(400).json({ message: "Password must be at least 8 characters!" });
-    }
-    if (email && !EMAIL_RE.test(email)) {
-      return res.status(400).json({ message: "Enter a valid email address!" });
-    }
-
     const existing = await UserModel.findOne({
-      $or: [{ username }, ...(email ? [{ email }] : [])],
+      $or: [{ username: input.username }, emailDuplicateFilter(input.email)],
     });
     if (existing) {
-      return res.status(409).json({ message: "Username or Email already exists!" });
+      return res.status(409).json({ message: "Username or email is already in use." });
     }
 
     const user = await UserModel.create({
-      first_name,
-      last_name,
-      username,
-      email: email || undefined,
-      phone: phone || undefined,
-      password: await bcrypt.hash(password, 10),
+      first_name: input.first_name,
+      last_name: input.last_name,
+      username: input.username,
+      email: input.email,
+      phone: input.phone,
+      password: await bcrypt.hash(input.password, 10),
       user_role: UserRole.USER,
     });
 
@@ -153,7 +149,15 @@ export const createUser = async (req: Request, res: Response) => {
       data: await UserModel.findById(user._id).select(SAFE_FIELDS),
     });
   } catch (error) {
-    console.error("Admin Create User Error:", error);
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === 11000
+    ) {
+      return res.status(409).json({ message: "Username or email is already in use." });
+    }
+    console.error("Admin customer account creation failed.");
     res.status(500).json({ message: "Failed to create user!" });
   }
 };
@@ -162,7 +166,7 @@ export const createUser = async (req: Request, res: Response) => {
 export const updateUser = async (req: Request, res: Response) => {
   try {
     const id = String(req.params.id);
-    if (!isValidId(id)) return res.status(400).json({ message: "Invalid user id!" });
+    if (!isValidRequestObjectId(id)) return res.status(400).json({ message: "Invalid user id!" });
 
     const { first_name, last_name, email, phone } = req.body;
     const set: Record<string, string> = {};
@@ -212,7 +216,7 @@ export const updateUserStatus = async (req: Request, res: Response) => {
     const id = String(req.params.id);
     const { status } = req.body;
 
-    if (!isValidId(id)) return res.status(400).json({ message: "Invalid user id!" });
+    if (!isValidRequestObjectId(id)) return res.status(400).json({ message: "Invalid user id!" });
     if (![UserStatus.ACTIVE, UserStatus.BLOCKED].includes(status)) {
       return res.status(400).json({ message: "Status must be ACTIVE or BLOCKED!" });
     }
@@ -239,7 +243,7 @@ export const updateUserStatus = async (req: Request, res: Response) => {
 export const deleteUser = async (req: Request, res: Response) => {
   try {
     const id = String(req.params.id);
-    if (!isValidId(id)) return res.status(400).json({ message: "Invalid user id!" });
+    if (!isValidRequestObjectId(id)) return res.status(400).json({ message: "Invalid user id!" });
 
     const user = await UserModel.findOneAndDelete({ _id: id, user_role: { $in: CUSTOMER_ROLES } });
     if (!user) return res.status(404).json({ message: "User not found!" });
@@ -248,5 +252,290 @@ export const deleteUser = async (req: Request, res: Response) => {
   } catch (error) {
     console.error("Admin Delete User Error:", error);
     res.status(500).json({ message: "Failed to delete user!" });
+  }
+};
+
+
+// ===================== ADVANCED ANALYTICS =====================
+
+export const getAnalytics = async (req: Request, res: Response) => {
+  try {
+    const getDate = (value: unknown): Date | null => {
+      if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+        return null;
+      }
+
+      const date = new Date(`${value}T00:00:00.000Z`);
+
+      if (
+        Number.isNaN(date.getTime()) ||
+        date.toISOString().slice(0, 10) !== value
+      ) {
+        return null;
+      }
+
+      return date;
+    };
+
+    const now = new Date();
+    const defaultTo = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+    );
+
+    const defaultFrom = new Date(defaultTo);
+    defaultFrom.setUTCDate(defaultFrom.getUTCDate() - 29);
+
+    const fromInput = req.query.from;
+    const toInput = req.query.to;
+
+    const from = fromInput === undefined
+      ? defaultFrom
+      : getDate(fromInput);
+
+    const to = toInput === undefined
+      ? defaultTo
+      : getDate(toInput);
+
+    if (!from || !to) {
+      return res.status(400).json({
+        message: "Invalid date. Use YYYY-MM-DD format.",
+      });
+    }
+
+    if (from > to) {
+      return res.status(400).json({
+        message: "Start date cannot be after end date.",
+      });
+    }
+
+    const days =
+      (to.getTime() - from.getTime()) / (1000 * 60 * 60 * 24);
+
+    if (days > 365) {
+      return res.status(400).json({
+        message: "Date range cannot exceed 366 days.",
+      });
+    }
+
+    const endExclusive = new Date(to);
+    endExclusive.setUTCDate(endExclusive.getUTCDate() + 1);
+
+    const match = {
+      createdAt: {
+        $gte: from,
+        $lt: endExclusive,
+      },
+    };
+
+    const [
+      summaryResult,
+      revenueTrend,
+      popularMovies,
+      bookingStatuses,
+      paymentStatuses,
+    ] = await Promise.all([
+      Booking.aggregate([
+        { $match: match },
+        {
+          $group: {
+            _id: null,
+            totalBookings: { $sum: 1 },
+            paidBookings: {
+              $sum: {
+                $cond: [{ $eq: ["$paymentStatus", "Paid"] }, 1, 0],
+              },
+            },
+            pendingBookings: {
+              $sum: {
+                $cond: [{ $eq: ["$bookingStatus", "Pending"] }, 1, 0],
+              },
+            },
+            cancelledBookings: {
+              $sum: {
+                $cond: [{ $eq: ["$bookingStatus", "Cancelled"] }, 1, 0],
+              },
+            },
+            failedPayments: {
+              $sum: {
+                $cond: [{ $eq: ["$paymentStatus", "Failed"] }, 1, 0],
+              },
+            },
+            ticketsSold: {
+              $sum: {
+                $cond: [
+                  { $eq: ["$paymentStatus", "Paid"] },
+                  "$totalSeats",
+                  0,
+                ],
+              },
+            },
+            revenue: {
+              $sum: {
+                $cond: [
+                  { $eq: ["$paymentStatus", "Paid"] },
+                  "$finalAmount",
+                  0,
+                ],
+              },
+            },
+          },
+        },
+      ]),
+
+      Booking.aggregate([
+        { $match: match },
+        {
+          $group: {
+            _id: {
+              $dateToString: {
+                format: "%Y-%m-%d",
+                date: "$createdAt",
+                timezone: "Asia/Colombo",
+              },
+            },
+            bookings: { $sum: 1 },
+            revenue: {
+              $sum: {
+                $cond: [
+                  { $eq: ["$paymentStatus", "Paid"] },
+                  "$finalAmount",
+                  0,
+                ],
+              },
+            },
+          },
+        },
+        { $sort: { _id: 1 } },
+        {
+          $project: {
+            _id: 0,
+            date: "$_id",
+            bookings: 1,
+            revenue: 1,
+          },
+        },
+      ]),
+
+      Booking.aggregate([
+        { $match: match },
+        {
+          $group: {
+            _id: "$movie",
+            bookings: { $sum: 1 },
+            ticketsSold: {
+              $sum: {
+                $cond: [
+                  { $eq: ["$paymentStatus", "Paid"] },
+                  "$totalSeats",
+                  0,
+                ],
+              },
+            },
+            revenue: {
+              $sum: {
+                $cond: [
+                  { $eq: ["$paymentStatus", "Paid"] },
+                  "$finalAmount",
+                  0,
+                ],
+              },
+            },
+          },
+        },
+        { $sort: { bookings: -1, revenue: -1 } },
+        { $limit: 5 },
+        {
+          $lookup: {
+            from: MovieModel.collection.name,
+            localField: "_id",
+            foreignField: "_id",
+            as: "movie",
+          },
+        },
+        {
+          $unwind: {
+            path: "$movie",
+            preserveNullAndEmptyArrays: true,
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            movieId: "$_id",
+            title: { $ifNull: ["$movie.title", "Deleted movie"] },
+            bookings: 1,
+            ticketsSold: 1,
+            revenue: 1,
+          },
+        },
+      ]),
+
+      Booking.aggregate([
+        { $match: match },
+        {
+          $group: {
+            _id: "$bookingStatus",
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { count: -1 } },
+        {
+          $project: {
+            _id: 0,
+            status: "$_id",
+            count: 1,
+          },
+        },
+      ]),
+
+      Booking.aggregate([
+        { $match: match },
+        {
+          $group: {
+            _id: "$paymentStatus",
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { count: -1 } },
+        {
+          $project: {
+            _id: 0,
+            status: "$_id",
+            count: 1,
+          },
+        },
+      ]),
+    ]);
+
+    const summary = summaryResult[0] ?? {
+      totalBookings: 0,
+      paidBookings: 0,
+      pendingBookings: 0,
+      cancelledBookings: 0,
+      failedPayments: 0,
+      ticketsSold: 0,
+      revenue: 0,
+    };
+
+    return res.status(200).json({
+      message: "Analytics loaded successfully!",
+      data: {
+        period: {
+          from: from.toISOString().slice(0, 10),
+          to: to.toISOString().slice(0, 10),
+        },
+        summary,
+        revenueTrend,
+        popularMovies,
+        bookingStatuses,
+        paymentStatuses,
+      },
+    });
+  } catch (error) {
+    console.error("Admin Analytics Error:", error);
+
+    return res.status(500).json({
+      message: "Failed to load analytics!",
+    });
   }
 };

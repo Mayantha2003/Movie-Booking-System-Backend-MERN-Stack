@@ -16,7 +16,8 @@ const router = Router();
 // Public / Guest routes
 // optionalAuthenticate: guests may book, and a valid token links the booking to the logged-in user
 router.post("/", optionalAuthenticate, createBooking);
-router.get("/code/:code", getBookingByCode);
+router.get("/code/:code", optionalAuthenticate, getBookingByCode);
+router.post("/code/:code", optionalAuthenticate, getBookingByCode);
 
 // Authenticated customer routes
 router.get("/my-bookings", authenticate, getMyBookings);

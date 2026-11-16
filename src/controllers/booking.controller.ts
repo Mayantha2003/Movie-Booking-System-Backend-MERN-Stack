@@ -4,7 +4,10 @@ import { Showtime } from "../models/showtime.model";
 import { Food } from "../models/food.model";
 import { Offer } from "../models/offer.model";
 import { UserModel } from "../models/user.model";
-import { generateBookingCode } from "../utils/bookingCode";
+import {
+  generateBookingCode,
+  normalizeBookingCode,
+} from "../utils/bookingCode";
 import { AuthRequest } from "../middleware/auth";
 import mongoose, { Types } from "mongoose";
 import { MovieModel } from "../models/movie.model";
@@ -15,6 +18,11 @@ import {
   generatePaymentToken,
   releaseExpiredHolds,
 } from "../services/bookingHold.service";
+import {
+  isValidRequestObjectId,
+  isValidRequestObjectIdArray,
+  parseOptionalQueryString,
+} from "../utils/requestValidation";
 
 // ===================== SEAT HELPERS =====================
 
@@ -150,8 +158,23 @@ export const createBooking = async (req: Request, res: Response) => {
       guestInfo, // { name, email, phone }
     } = req.body;
 
-    if (typeof showtimeId !== "string" || !Types.ObjectId.isValid(showtimeId)) {
+    if (!isValidRequestObjectId(showtimeId)) {
       return res.status(400).json({ message: "Invalid showtime id!" });
+    }
+    if (foodItems !== undefined && !Array.isArray(foodItems)) {
+      return res.status(400).json({ message: "Food items must be a list!" });
+    }
+    if (foodItems !== undefined) {
+      const foodIds = foodItems.map((item: unknown) =>
+        item && typeof item === "object" && !Array.isArray(item)
+          ? (item as { foodId?: unknown }).foodId
+          : undefined
+      );
+      if (!isValidRequestObjectIdArray(foodIds)) {
+        return res.status(400).json({
+          message: "Each food item needs a valid id and positive quantity!",
+        });
+      }
     }
 
     await releaseExpiredHolds({ showtimeId });
@@ -233,7 +256,7 @@ export const createBooking = async (req: Request, res: Response) => {
 
     // A logged-in booking must point to a real account (token may outlive a deleted user)
     if (userId) {
-      const userExists = Types.ObjectId.isValid(userId)
+      const userExists = isValidRequestObjectId(userId)
         ? await UserModel.exists({ _id: userId })
         : null;
       if (!userExists) {
@@ -265,10 +288,6 @@ export const createBooking = async (req: Request, res: Response) => {
     const ticketTotal = Math.round(totalSeats * ticketPrice * 100) / 100;
 
     // 5. Process Food Items
-    if (foodItems !== undefined && !Array.isArray(foodItems)) {
-      return res.status(400).json({ message: "Food items must be a list!" });
-    }
-
     let processedFoodItems: {
       food: Types.ObjectId;
       quantity: number;
@@ -281,7 +300,7 @@ export const createBooking = async (req: Request, res: Response) => {
         if (
           !item ||
           typeof item.foodId !== "string" ||
-          !Types.ObjectId.isValid(item.foodId) ||
+          !isValidRequestObjectId(item.foodId) ||
           !Number.isSafeInteger(item.quantity ?? 1) ||
           (item.quantity ?? 1) < 1
         ) {
@@ -604,7 +623,7 @@ export const createBooking = async (req: Request, res: Response) => {
         : [];
       const seatIds =
         typeof seats === "string" ? [] : seats.map((seat) => seat.seatId);
-      if (seatIds.length && Types.ObjectId.isValid(req.body?.showtimeId)) {
+      if (seatIds.length && isValidRequestObjectId(req.body?.showtimeId)) {
         const nowTaken = await findUnavailableSeatIds(
           new Types.ObjectId(req.body.showtimeId),
           seatIds
@@ -630,7 +649,7 @@ export const getMyBookings = async (req: AuthRequest, res: Response) => {
       });
     }
 
-    if (!Types.ObjectId.isValid(req.user.sub)) {
+    if (!isValidRequestObjectId(req.user.sub)) {
       return res.status(401).json({ message: "Invalid user session!" });
     }
 
@@ -655,23 +674,78 @@ export const getMyBookings = async (req: AuthRequest, res: Response) => {
 
 // ===================== GET BOOKING BY CODE =====================
 export const getBookingByCode = async (req: Request, res: Response) => {
+  const bookingCode = normalizeBookingCode(req.params.code);
+  if (!bookingCode) {
+    return res.status(404).json({ message: "Booking not found!" });
+  }
+
   try {
     const booking = await Booking.findOne({
-      bookingCode: (req.params.code as string).toUpperCase(),
+      bookingCode,
     })
+      .select(
+        "bookingCode user guestInfo.name guestInfo.email guestInfo.phone showtime movie cinema screen seats totalSeats ticketPrice foodTotal discountAmount offer finalAmount paymentStatus bookingStatus"
+      )
       .populate("movie", "title poster duration")
-      .populate("cinema", "name location city address")
+      .populate("cinema", "name address")
       .populate("screen", "name screenType")
-      .populate("showtime", "showDate startTime endTime ticketPrice")
-      .populate("offer", "code description discountType discountValue");
+      .populate("showtime", "showDate startTime ticketPrice")
+      .populate("offer", "code")
+      .lean();
 
     if (!booking) {
       return res.status(404).json({ message: "Booking not found!" });
     }
 
+    const isLegacyCode = /^BK-[A-HJ-NP-Z2-9]{6}$/i.test(bookingCode);
+    if (isLegacyCode) {
+      const authenticatedUserId = (req as AuthRequest).user?.sub;
+      const ownsAccountBooking =
+        booking.user &&
+        authenticatedUserId === String(booking.user);
+      const verification =
+        req.method === "POST" ? req.body : undefined;
+      const suppliedEmail =
+        typeof verification?.email === "string"
+          ? verification.email.trim().toLowerCase()
+          : "";
+      const suppliedPhone =
+        typeof verification?.phone === "string"
+          ? verification.phone.trim()
+          : "";
+      const verifiesGuestBooking =
+        !booking.user &&
+        Boolean(booking.guestInfo?.email) &&
+        Boolean(booking.guestInfo?.phone) &&
+        suppliedEmail === booking.guestInfo?.email?.trim().toLowerCase() &&
+        suppliedPhone === booking.guestInfo?.phone?.trim();
+
+      if (!ownsAccountBooking && !verifiesGuestBooking) {
+        return res.status(404).json({ message: "Booking not found!" });
+      }
+    }
+
     res.status(200).json({
       message: "Success!",
-      data: booking,
+      data: {
+        bookingCode: booking.bookingCode,
+        ...(booking.guestInfo?.name
+          ? { guestInfo: { name: booking.guestInfo.name } }
+          : {}),
+        movie: booking.movie,
+        cinema: booking.cinema,
+        screen: booking.screen,
+        showtime: booking.showtime,
+        seats: booking.seats.map(({ seatId }) => ({ seatId })),
+        totalSeats: booking.totalSeats,
+        ticketPrice: booking.ticketPrice,
+        foodTotal: booking.foodTotal,
+        discountAmount: booking.discountAmount,
+        offer: booking.offer,
+        finalAmount: booking.finalAmount,
+        paymentStatus: booking.paymentStatus,
+        bookingStatus: booking.bookingStatus,
+      },
     });
   } catch (error) {
     console.error("GetBookingByCode Error:", error);
@@ -681,12 +755,23 @@ export const getBookingByCode = async (req: Request, res: Response) => {
 
 // ===================== GET ALL BOOKINGS (Admin) =====================
 export const getAllBookings = async (req: Request, res: Response) => {
-  try {
-    const { status, paymentStatus } = req.query;
+  const parsedStatus = parseOptionalQueryString(req.query.status);
+  const parsedPaymentStatus = parseOptionalQueryString(req.query.paymentStatus);
+  const bookingStatuses = ["Pending", "Confirmed", "Cancelled", "Completed"];
+  const paymentStatuses = ["Pending", "Paid", "Failed", "Cancelled", "Refunded"];
+  if (
+    !parsedStatus.valid ||
+    (parsedStatus.value && !bookingStatuses.includes(parsedStatus.value)) ||
+    !parsedPaymentStatus.valid ||
+    (parsedPaymentStatus.value && !paymentStatuses.includes(parsedPaymentStatus.value))
+  ) {
+    return res.status(400).json({ message: "Invalid booking status filters." });
+  }
 
+  try {
     const filter: any = {};
-    if (status) filter.bookingStatus = status;
-    if (paymentStatus) filter.paymentStatus = paymentStatus;
+    if (parsedStatus.value) filter.bookingStatus = parsedStatus.value;
+    if (parsedPaymentStatus.value) filter.paymentStatus = parsedPaymentStatus.value;
 
     const bookings = await Booking.find(filter)
       .populate("user", "first_name last_name email")
@@ -709,6 +794,10 @@ export const getAllBookings = async (req: Request, res: Response) => {
 
 // ===================== CANCEL BOOKING =====================
 export const cancelBooking = async (req: AuthRequest, res: Response) => {
+  if (!isValidRequestObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid booking id." });
+  }
+
   try {
     const booking = await Booking.findById(req.params.id);
 
@@ -735,7 +824,12 @@ export const cancelBooking = async (req: AuthRequest, res: Response) => {
       {
         $set: {
           bookingStatus: "Cancelled",
-          paymentStatus: previousStatus === "Pending" ? "Cancelled" : "Refunded",
+          paymentStatus:
+            booking.paymentStatus === "Paid"
+              ? "Paid"
+              : previousStatus === "Pending"
+                ? "Cancelled"
+                : booking.paymentStatus,
           holdExpiresAt: null,
           paymentTokenHash: null,
         },

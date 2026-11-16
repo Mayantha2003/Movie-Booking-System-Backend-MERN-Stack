@@ -1,47 +1,51 @@
 import { Request, Response } from "express";
-import { isValidObjectId } from "mongoose";
 import { Showtime } from "../models/showtime.model";
 import { Booking } from "../models/booking.model";
 import { MovieModel } from "../models/movie.model";
 import { Cinema } from "../models/cinema.model";
 import { Screen } from "../models/screen.model";
+import {
+  adminInputErrorStatus,
+  isValidAdminObjectId,
+  validateShowtimeInput,
+} from "../utils/adminCrudInput";
+import {
+  isValidRequestObjectId,
+  parseOptionalDateQuery,
+  parseOptionalObjectIdQuery,
+  parseOptionalQueryBoolean,
+} from "../utils/requestValidation";
 
 // ===================== CREATE SHOWTIME =====================
 export const createShowtime = async (req: Request, res: Response) => {
-  try {
-    const { movie, cinema, screen, showDate, startTime, endTime, ticketPrice } = req.body;
+  const input = validateShowtimeInput(req.body, true);
+  if (typeof input === "string") return res.status(400).json({ message: input });
 
-    // Check Movie exists
-    const movieExists = await MovieModel.findById(movie);
+  try {
+    const movieExists = await MovieModel.findById(input.movie);
     if (!movieExists) {
       return res.status(404).json({ message: "Movie not found!" });
     }
 
-    // Check Cinema exists
-    const cinemaExists = await Cinema.findById(cinema);
+    const cinemaExists = await Cinema.findById(input.cinema);
     if (!cinemaExists) {
       return res.status(404).json({ message: "Cinema not found!" });
     }
 
-    // Check Screen exists
-    const screenExists = await Screen.findById(screen);
+    const screenExists = await Screen.findById(input.screen);
     if (!screenExists) {
       return res.status(404).json({ message: "Screen not found!" });
     }
+    if (String(screenExists.cinema) !== String(input.cinema)) {
+      return res.status(400).json({ message: "The selected screen does not belong to the selected cinema." });
+    }
 
-    // Screen totalSeats 
     const totalSeats = screenExists.totalSeats;
 
     const showtime = await Showtime.create({
-      movie,
-      cinema,
-      screen,
-      showDate,
-      startTime,
-      endTime,
-      ticketPrice,
+      ...input,
       totalSeats,
-      availableSeats: totalSeats, // seats available
+      availableSeats: totalSeats,
     });
 
     res.status(201).json({
@@ -49,22 +53,37 @@ export const createShowtime = async (req: Request, res: Response) => {
       data: showtime,
     });
   } catch (error) {
-    console.error("CreateShowtime Error:", error);
-    res.status(500).json({ message: "Failed to create showtime!" });
+    const status = adminInputErrorStatus(error);
+    res.status(status).json({
+      message: status === 400 ? "Showtime data is invalid." : "Failed to create showtime!",
+    });
   }
 };
 
 // ===================== GET ALL SHOWTIMES =====================
 export const getAllShowtimes = async (req: Request, res: Response) => {
-  try {
-    const { movie, cinema, screen, showDate, isActive } = req.query;
+  const parsedMovie = parseOptionalObjectIdQuery(req.query.movie);
+  const parsedCinema = parseOptionalObjectIdQuery(req.query.cinema);
+  const parsedScreen = parseOptionalObjectIdQuery(req.query.screen);
+  const parsedDate = parseOptionalDateQuery(req.query.showDate);
+  const parsedIsActive = parseOptionalQueryBoolean(req.query.isActive);
+  if (
+    !parsedMovie.valid ||
+    !parsedCinema.valid ||
+    !parsedScreen.valid ||
+    !parsedDate.valid ||
+    !parsedIsActive.valid
+  ) {
+    return res.status(400).json({ message: "Invalid showtime query parameters." });
+  }
 
+  try {
     const filter: any = {};
-    if (movie) filter.movie = movie;
-    if (cinema) filter.cinema = cinema;
-    if (screen) filter.screen = screen;
-    if (showDate) filter.showDate = new Date(showDate as string);
-    if (isActive !== undefined) filter.isActive = isActive === "true";
+    if (parsedMovie.value) filter.movie = parsedMovie.value;
+    if (parsedCinema.value) filter.cinema = parsedCinema.value;
+    if (parsedScreen.value) filter.screen = parsedScreen.value;
+    if (parsedDate.value) filter.showDate = parsedDate.value;
+    if (parsedIsActive.value !== undefined) filter.isActive = parsedIsActive.value;
 
     const showtimes = await Showtime.find(filter)
       .populate("movie", "title poster duration")
@@ -85,6 +104,10 @@ export const getAllShowtimes = async (req: Request, res: Response) => {
 
 // ===================== GET SINGLE SHOWTIME =====================
 export const getShowtimeById = async (req: Request, res: Response) => {
+  if (!isValidRequestObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid showtime id." });
+  }
+
   try {
     const showtime = await Showtime.findById(req.params.id)
       .populate("movie", "title poster duration genre language")
@@ -107,19 +130,25 @@ export const getShowtimeById = async (req: Request, res: Response) => {
 
 // ===================== GET SHOWTIMES BY MOVIE =====================
 export const getShowtimesByMovie = async (req: Request, res: Response) => {
-  try {
-    const { date } = req.query;
+  if (!isValidRequestObjectId(req.params.movieId)) {
+    return res.status(400).json({ message: "Invalid movie id." });
+  }
+  const parsedDate = parseOptionalDateQuery(req.query.date);
+  if (!parsedDate.valid) {
+    return res.status(400).json({ message: "Invalid date parameter." });
+  }
 
+  try {
     const filter: any = {
       movie: req.params.movieId,
       isActive: true,
     };
 
-    if (date) {
-      const startOfDay = new Date(date as string);
+    if (parsedDate.value) {
+      const startOfDay = new Date(parsedDate.value);
       startOfDay.setHours(0, 0, 0, 0);
 
-      const endOfDay = new Date(date as string);
+      const endOfDay = new Date(parsedDate.value);
       endOfDay.setHours(23, 59, 59, 999);
 
       filter.showDate = { $gte: startOfDay, $lte: endOfDay };
@@ -143,8 +172,50 @@ export const getShowtimesByMovie = async (req: Request, res: Response) => {
 
 // ===================== UPDATE SHOWTIME =====================
 export const updateShowtime = async (req: Request, res: Response) => {
+  if (!isValidAdminObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid showtime id." });
+  }
+  const input = validateShowtimeInput(req.body, false);
+  if (typeof input === "string") return res.status(400).json({ message: input });
+
   try {
-    const showtime = await Showtime.findByIdAndUpdate(req.params.id, req.body, {
+    const current = await Showtime.findById(req.params.id);
+    if (!current) return res.status(404).json({ message: "Showtime not found!" });
+
+    const currentLinks = {
+      movie: String(current.movie),
+      cinema: String(current.cinema),
+      screen: String(current.screen),
+    };
+    for (const key of ["movie", "cinema", "screen"] as const) {
+      if (input[key] !== undefined && String(input[key]) !== currentLinks[key]) {
+        return res.status(400).json({ message: "Showtime movie, cinema and screen assignments cannot be changed after creation." });
+      }
+    }
+
+    const merged = validateShowtimeInput({
+      movie: currentLinks.movie,
+      cinema: currentLinks.cinema,
+      screen: currentLinks.screen,
+      showDate: input.showDate ?? current.showDate,
+      startTime: input.startTime ?? current.startTime,
+      endTime: input.endTime ?? current.endTime,
+      ticketPrice: input.ticketPrice ?? current.ticketPrice,
+      ...("isActive" in input ? { isActive: input.isActive } : {}),
+    }, true);
+    if (typeof merged === "string") return res.status(400).json({ message: merged });
+
+    const movieExists = await MovieModel.findById(current.movie);
+    const cinemaExists = await Cinema.findById(current.cinema);
+    const screenExists = await Screen.findById(current.screen);
+    if (!movieExists || !cinemaExists || !screenExists) {
+      return res.status(400).json({ message: "Showtime references must point to existing records." });
+    }
+    if (String(screenExists.cinema) !== currentLinks.cinema) {
+      return res.status(400).json({ message: "The selected screen does not belong to the selected cinema." });
+    }
+
+    const showtime = await Showtime.findByIdAndUpdate(req.params.id, { $set: input }, {
       new: true,
       runValidators: true,
     })
@@ -161,13 +232,19 @@ export const updateShowtime = async (req: Request, res: Response) => {
       data: showtime,
     });
   } catch (error) {
-    console.error("UpdateShowtime Error:", error);
-    res.status(500).json({ message: "Failed to update showtime!" });
+    const status = adminInputErrorStatus(error);
+    res.status(status).json({
+      message: status === 400 ? "Showtime data is invalid." : "Failed to update showtime!",
+    });
   }
 };
 
 // ===================== DELETE SHOWTIME =====================
 export const deleteShowtime = async (req: Request, res: Response) => {
+  if (!isValidRequestObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid showtime id." });
+  }
+
   try {
     const showtime = await Showtime.findByIdAndDelete(req.params.id);
 
@@ -186,12 +263,12 @@ export const deleteShowtime = async (req: Request, res: Response) => {
 
 // ===================== GET BOOKED SEATS FOR A SHOWTIME =====================
 export const getBookedSeats = async (req: Request, res: Response) => {
+  if (!isValidRequestObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid showtime id!" });
+  }
+
   try {
     const id = req.params.id as string;
-
-    if (!isValidObjectId(id)) {
-      return res.status(400).json({ message: "Invalid showtime id!" });
-    }
 
     const showtime = await Showtime.findById(id).select(
       "totalSeats availableSeats"

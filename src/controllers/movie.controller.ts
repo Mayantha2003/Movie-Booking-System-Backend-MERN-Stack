@@ -1,6 +1,11 @@
 import { Request, Response } from "express";
 import { MovieModel } from "../models/movie.model";
 import { detectImageType, uploadImage, deleteImageByUrl } from "../utils/storage";
+import {
+  isValidRequestObjectId,
+  parseOptionalDateQuery,
+  parseOptionalQueryString,
+} from "../utils/requestValidation";
 
 const YOUTUBE_URL = /^https?:\/\/(www\.|m\.)?(youtube\.com|youtu\.be|youtube-nocookie\.com)\/\S+$/i;
 const isBlankOrYouTube = (v: unknown) => v === undefined || v === null || v === "" || (typeof v === "string" && YOUTUBE_URL.test(v.trim()));
@@ -44,6 +49,10 @@ export const getComingSoon = async (req: Request, res: Response) => {
 
 // ===================== GET SINGLE MOVIE =====================
 export const getMovieById = async (req: Request, res: Response) => {
+  if (!isValidRequestObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid movie id." });
+  }
+
   try {
     const { id } = req.params;
 
@@ -65,6 +74,11 @@ export const getMovieById = async (req: Request, res: Response) => {
 
 // ===================== CREATE MOVIE (Admin) =====================
 export const createMovie = async (req: Request, res: Response) => {
+  const parsedReleaseDate = parseOptionalDateQuery(req.body?.release_date);
+  if (!parsedReleaseDate.valid || !parsedReleaseDate.value) {
+    return res.status(400).json({ message: "Release date must be a valid ISO date." });
+  }
+
   try {
     const {
       title,
@@ -72,7 +86,6 @@ export const createMovie = async (req: Request, res: Response) => {
       genre,
       language,
       duration,
-      release_date,
       status,
       poster,
       banner,
@@ -83,7 +96,7 @@ export const createMovie = async (req: Request, res: Response) => {
     } = req.body;
 
     // Simple validation
-    if (!title || !description || !genre || !language || !duration || !release_date || !poster || !director) {
+    if (!title || !description || !genre || !language || !duration || !poster || !director) {
       return res.status(400).json({ message: "Required fields are missing!" });
     }
 
@@ -97,7 +110,7 @@ export const createMovie = async (req: Request, res: Response) => {
       genre,
       language,
       duration,
-      release_date,
+      release_date: parsedReleaseDate.value,
       status: status || "coming_soon",
       poster,
       banner,
@@ -122,6 +135,16 @@ export const createMovie = async (req: Request, res: Response) => {
 
 // ===================== UPDATE MOVIE (Admin) =====================
 export const updateMovie = async (req: Request, res: Response) => {
+  if (!isValidRequestObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid movie id." });
+  }
+  const parsedReleaseDate = req.body?.release_date === undefined
+    ? undefined
+    : parseOptionalDateQuery(req.body.release_date);
+  if (parsedReleaseDate && (!parsedReleaseDate.valid || !parsedReleaseDate.value)) {
+    return res.status(400).json({ message: "Release date must be a valid ISO date." });
+  }
+
   try {
     const { id } = req.params;
 
@@ -134,7 +157,10 @@ export const updateMovie = async (req: Request, res: Response) => {
       return res.status(404).json({ message: "Movie not found!" });
     }
 
-    const updatedMovie = await MovieModel.findByIdAndUpdate(id, req.body, {
+    const update = parsedReleaseDate?.value
+      ? { ...req.body, release_date: parsedReleaseDate.value }
+      : req.body;
+    const updatedMovie = await MovieModel.findByIdAndUpdate(id, update, {
       new: true,
       runValidators: true,
     });
@@ -166,6 +192,10 @@ export const updateMovie = async (req: Request, res: Response) => {
 
 // ===================== DELETE MOVIE (Admin) =====================
 export const deleteMovie = async (req: Request, res: Response) => {
+  if (!isValidRequestObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid movie id." });
+  }
+
   try {
     const { id } = req.params;
 
@@ -191,6 +221,11 @@ export const deleteMovie = async (req: Request, res: Response) => {
 // POST /api/movies/upload-image?kind=poster|banner   (multipart, field name "image")
 // Returns the full public URL. The admin form puts it into the movie's poster / banner field.
 export const uploadMovieImage = async (req: Request, res: Response) => {
+  const parsedKind = parseOptionalQueryString(req.query.kind);
+  if (!parsedKind.valid || (parsedKind.value && !["poster", "banner"].includes(parsedKind.value))) {
+    return res.status(400).json({ message: "Image kind must be poster or banner." });
+  }
+
   try {
     if (!req.file) {
       return res.status(400).json({ message: "No image uploaded! Send it in the 'image' field." });
@@ -201,7 +236,7 @@ export const uploadMovieImage = async (req: Request, res: Response) => {
       return res.status(400).json({ message: "The file is not a valid JPG, PNG or WebP image!" });
     }
 
-    const folder = req.query.kind === "banner" ? "banners" : "posters";
+    const folder = parsedKind.value === "banner" ? "banners" : "posters";
     const { url, path } = await uploadImage(req.file.buffer, type, folder);
 
     res.status(201).json({

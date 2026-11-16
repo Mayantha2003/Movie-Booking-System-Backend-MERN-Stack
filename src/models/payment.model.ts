@@ -1,6 +1,11 @@
+
 import { Document, Schema, Types, model } from "mongoose";
 
-export type PaymentStatus = "PENDING" | "SUCCESS" | "FAILED" | "CANCELLED";
+export type PaymentStatus =
+  | "PENDING"
+  | "SUCCESS"
+  | "FAILED"
+  | "CANCELLED";
 
 export interface IPaymentEvent {
   at: Date;
@@ -13,34 +18,61 @@ export interface IPayment extends Document {
   orderId: string;
   booking: Types.ObjectId;
   user?: Types.ObjectId | null;
+
   amount: number;
   currency: string;
   status: PaymentStatus;
   attempt: number;
+
   events: IPaymentEvent[];
+
   statusCode?: number;
   statusMessage?: string;
   method?: string;
   payherePaymentId?: string;
   paidAt?: Date;
+
+  // Email notification tracking
+  emailSent: boolean;
+  emailSentAt?: Date;
+
   refundRequired: boolean;
   chargedBack: boolean;
+
   createdAt: Date;
   updatedAt: Date;
 }
 
+// --------------------------------------------------
+// PAYMENT EVENT SCHEMA
+// --------------------------------------------------
+
 const paymentEventSchema = new Schema<IPaymentEvent>(
   {
-    at: { type: Date, required: true, default: Date.now },
+    at: {
+      type: Date,
+      required: true,
+      default: Date.now,
+    },
+
     status: {
       type: String,
       enum: ["PENDING", "SUCCESS", "FAILED", "CANCELLED"],
       required: true,
     },
-    statusCode: { type: Number },
-    note: { type: String, required: true },
+
+    statusCode: {
+      type: Number,
+    },
+
+    note: {
+      type: String,
+      required: true,
+    },
   },
-  { _id: false }
+  {
+    _id: false,
+  }
 );
 
 const paymentSchema = new Schema<IPayment>(
@@ -52,66 +84,124 @@ const paymentSchema = new Schema<IPayment>(
       uppercase: true,
       trim: true,
     },
+
     booking: {
       type: Schema.Types.ObjectId,
       ref: "Booking",
       required: true,
     },
+
     user: {
       type: Schema.Types.ObjectId,
       ref: "User",
       default: null,
     },
+
     amount: {
       type: Number,
       required: true,
       min: 0,
     },
+
     currency: {
       type: String,
       required: true,
       default: "LKR",
     },
+
     status: {
       type: String,
       enum: ["PENDING", "SUCCESS", "FAILED", "CANCELLED"],
       default: "PENDING",
       required: true,
     },
+
     attempt: {
       type: Number,
       required: true,
       min: 1,
     },
+
     events: {
       type: [paymentEventSchema],
       default: [],
     },
-    statusCode: { type: Number },
-    statusMessage: { type: String },
-    method: { type: String },
-    payherePaymentId: { type: String },
-    paidAt: { type: Date },
+
+    statusCode: {
+      type: Number,
+    },
+
+    statusMessage: {
+      type: String,
+    },
+
+    method: {
+      type: String,
+    },
+
+    payherePaymentId: {
+      type: String,
+    },
+
+    paidAt: {
+      type: Date,
+    },
+
+    emailSent: {
+      type: Boolean,
+      default: false,
+    },
+
+    emailSentAt: {
+      type: Date,
+    },
+
     refundRequired: {
       type: Boolean,
       default: false,
     },
+
     chargedBack: {
       type: Boolean,
       default: false,
     },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+  }
 );
 
+// One payment attempt per booking.
 paymentSchema.index(
-  { booking: 1, attempt: 1 },
-  { unique: true, name: "unique_payment_attempt_per_booking" }
+  {
+    booking: 1,
+    attempt: 1,
+  },
+  {
+    unique: true,
+    name: "unique_payment_attempt_per_booking",
+  }
 );
-paymentSchema.index(
-  { payherePaymentId: 1 },
-  { unique: true, sparse: true, name: "unique_payhere_payment_id" }
-);
-paymentSchema.index({ booking: 1, status: 1 });
 
-export const Payment = model<IPayment>("Payment", paymentSchema);
+// Prevent one PayHere payment ID being used for multiple orders.
+paymentSchema.index(
+  {
+    payherePaymentId: 1,
+  },
+  {
+    unique: true,
+    sparse: true,
+    name: "unique_payhere_payment_id",
+  }
+);
+
+// Find payments belonging to a booking by status.
+paymentSchema.index({
+  booking: 1,
+  status: 1,
+});
+
+export const Payment = model<IPayment>(
+  "Payment",
+  paymentSchema
+);

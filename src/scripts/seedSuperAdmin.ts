@@ -7,6 +7,10 @@ import {
   UserRole,
   UserStatus
 } from "../models/user.model";
+import {
+  emailDuplicateFilter,
+  validateAccountInput,
+} from "../utils/accountInput";
 
 dotenv.config();
 
@@ -19,6 +23,17 @@ const seedSuperAdmin = async () => {
 
     if (!mongoUrl || !username || !email || !password) {
       throw new Error("Required environment variables are missing!");
+    }
+
+    const input = validateAccountInput({
+      first_name: "System",
+      last_name: "Administrator",
+      username,
+      email,
+      password,
+    });
+    if (typeof input === "string") {
+      throw new Error(input);
     }
 
     await mongoose.connect(mongoUrl);
@@ -38,8 +53,8 @@ const seedSuperAdmin = async () => {
     // Check duplicate username or email
     const existingUser = await UserModel.findOne({
       $or: [
-        { username },
-        { email }
+        { username: input.username },
+        emailDuplicateFilter(input.email),
       ]
     });
 
@@ -54,8 +69,8 @@ const seedSuperAdmin = async () => {
     await UserModel.create({
       first_name: "System",
       last_name: "Administrator",
-      username,
-      email,
+      username: input.username,
+      email: input.email,
       password: hashedPassword,
       user_role: UserRole.SUPER_ADMIN,
       user_status: UserStatus.ACTIVE
