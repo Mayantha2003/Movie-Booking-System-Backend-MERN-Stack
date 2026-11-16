@@ -29,7 +29,6 @@ export interface IPayment extends Document {
   statusCode?: number;
   statusMessage?: string;
   method?: string;
-  payherePaymentId?: string;
   paidAt?: Date;
 
   // Email notification tracking
@@ -139,10 +138,6 @@ const paymentSchema = new Schema<IPayment>(
       type: String,
     },
 
-    payherePaymentId: {
-      type: String,
-    },
-
     paidAt: {
       type: Date,
     },
@@ -180,18 +175,6 @@ paymentSchema.index(
   {
     unique: true,
     name: "unique_payment_attempt_per_booking",
-  }
-);
-
-// Prevent one PayHere payment ID being used for multiple orders.
-paymentSchema.index(
-  {
-    payherePaymentId: 1,
-  },
-  {
-    unique: true,
-    sparse: true,
-    name: "unique_payhere_payment_id",
   }
 );
 

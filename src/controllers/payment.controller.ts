@@ -3,61 +3,31 @@ import type { Request, Response } from "express";
 import { Types } from "mongoose";
 
 import { Booking } from "../models/booking.model";
-import {
-  Payment,
-  type IPayment,
-  type PaymentStatus,
-} from "../models/payment.model";
-import { Showtime } from "../models/showtime.model";
-import { Offer } from "../models/offer.model";
+import { Payment, type PaymentStatus } from "../models/payment.model";
 import { UserModel } from "../models/user.model";
-
-import {
-  getPayHereConfig,
-  PAYHERE_MAX_ATTEMPTS,
-} from "../config/payhere";
-
-import {
-  amountsMatch,
-  buildCheckoutForm,
-  buildOrderId,
-  type CheckoutCustomer,
-  mapStatusCode,
-  parseNotification,
-  type PayHereNotification,
-  splitName,
-  verifyNotificationSignature,
-} from "../services/payhere.service";
 
 import {
   releaseExpiredHolds,
   verifyPaymentToken,
 } from "../services/bookingHold.service";
-
 import {
   generateTicketPdf,
   type TicketData,
 } from "../services/ticketPdf.service";
-
-import {
-  sendBookingConfirmationEmail,
-} from "../services/email.service";
-
-// --------------------------------------------------
-// CONSTANTS & HELPERS
-// --------------------------------------------------
+import { sendBookingConfirmationEmail } from "../services/email.service";
 
 const INVALID_LINK_MESSAGE =
   "This payment link is not valid. Please start your booking again.";
 
-const FALLBACK_EMAIL = "customer@example.com";
-const FALLBACK_PHONE = "0770000000";
+const DEMO_MAX_ATTEMPTS = 3;
 
-const isDuplicateKeyError = (error: unknown): boolean =>
-  typeof error === "object" &&
-  error !== null &&
-  "code" in error &&
-  error.code === 11000;
+const isDemoPaymentsEnabled = (): boolean =>
+  process.env.DEMO_PAYMENTS_ENABLED?.trim().toLowerCase() === "true";
+
+const normalizeDemoOrderId = (
+  bookingCode: string,
+  attempt: number
+): string => `DEMO-${bookingCode}-${attempt}`;
 
 const auditEvent = (
   status: PaymentStatus,
@@ -70,93 +40,11 @@ const auditEvent = (
   note,
 });
 
-// --------------------------------------------------
-// CHECKOUT CUSTOMER
-// --------------------------------------------------
-
-const getCheckoutCustomer = async (booking: {
-  user?: Types.ObjectId | null;
-  guestInfo?: {
-    name?: string;
-    email?: string;
-    phone?: string;
-  };
-}): Promise<CheckoutCustomer> => {
-  if (booking.user) {
-    const user = await UserModel.findById(booking.user)
-      .select("first_name last_name email phone")
-      .lean();
-
-    if (user) {
-      return {
-        firstName: user.first_name || "Customer",
-        lastName: user.last_name || "Customer",
-        email: user.email || FALLBACK_EMAIL,
-        phone: user.phone || FALLBACK_PHONE,
-      };
-    }
-  }
-
-  const guest = booking.guestInfo;
-  const { firstName, lastName } = splitName(
-    guest?.name ?? ""
-  );
-
-  return {
-    firstName,
-    lastName,
-    email: guest?.email || FALLBACK_EMAIL,
-    phone: guest?.phone || FALLBACK_PHONE,
-  };
-};
-
-// --------------------------------------------------
-// RESTORE BOOKING CAPACITY
-// --------------------------------------------------
-
-const restoreBookingCapacity = async (booking: {
-  showtime: Types.ObjectId;
-  totalSeats: number;
-  offer?: Types.ObjectId | null;
-}): Promise<void> => {
-  await Showtime.updateOne(
-    { _id: booking.showtime },
-    {
-      $inc: {
-        availableSeats: booking.totalSeats,
-      },
-    }
-  );
-
-  if (booking.offer) {
-    await Offer.updateOne(
-      {
-        _id: booking.offer,
-        usedCount: { $gt: 0 },
-      },
-      {
-        $inc: {
-          usedCount: -1,
-        },
-      }
-    );
-  }
-};
-
-// --------------------------------------------------
-// SEND BOOKING CONFIRMATION EMAIL
-// --------------------------------------------------
-
 const sendConfirmationEmailIfNeeded = async (
   paymentId: Types.ObjectId,
   bookingId: Types.ObjectId
 ): Promise<void> => {
-  /*
-   * Claim the email notification atomically.
-   *
-   * Only SUCCESS payments which are not charged back
-   * and do not require a refund are eligible.
-   */
+  if (Booking.db.readyState !== 1) return;
 
   const claimedPayment = await Payment.findOneAndUpdate(
     {
@@ -169,21 +57,13 @@ const sendConfirmationEmailIfNeeded = async (
         { emailSent: { $exists: false } },
       ],
     },
-    {
-      $set: {
-        emailSent: true,
-      },
-    },
-    {
-      new: true,
-    }
+    { $set: { emailSent: true } },
+    { new: true }
   );
 
-  // Already sent or another request is processing it.
   if (!claimedPayment) return;
 
   try {
-    // Verify that this payment owns the booking.
     const paymentOwner = await Payment.findOne({
       booking: bookingId,
       status: "SUCCESS",
@@ -196,73 +76,47 @@ const sendConfirmationEmailIfNeeded = async (
 
     if (
       !paymentOwner ||
-      !paymentOwner._id.equals(paymentId)
+      paymentOwner._id.toString() !== paymentId.toString()
     ) {
       await Payment.updateOne(
         { _id: paymentId },
         {
-          $set: {
-            emailSent: false,
-          },
-          $unset: {
-            emailSentAt: 1,
-          },
+          $set: { emailSent: false },
+          $unset: { emailSentAt: 1 },
         }
       );
-
       return;
     }
 
-    // Load complete booking information.
     const booking = await Booking.findById(bookingId)
       .populate("movie", "title")
       .populate("cinema", "name")
       .populate("screen", "name")
       .populate("showtime", "showDate startTime");
 
-    if (!booking) {
-      throw new Error("Booking not found.");
-    }
+    if (!booking) throw new Error("Booking not found.");
 
-    // Only paid and confirmed bookings can receive tickets.
     if (
       booking.paymentStatus !== "Paid" ||
-      !["Confirmed", "Completed"].includes(
-        booking.bookingStatus
-      )
+      !["Confirmed", "Completed"].includes(booking.bookingStatus)
     ) {
-      throw new Error(
-        "Booking is not eligible for an e-ticket."
-      );
+      throw new Error("Booking is not eligible for an e-ticket.");
     }
 
-    const movie = booking.movie as unknown as {
-      title: string;
-    } | null;
-
-    const cinema = booking.cinema as unknown as {
-      name: string;
-    } | null;
-
-    const screen = booking.screen as unknown as {
-      name: string;
-    } | null;
-
+    const movie = booking.movie as unknown as { title: string } | null;
+    const cinema = booking.cinema as unknown as { name: string } | null;
+    const screen = booking.screen as unknown as { name: string } | null;
     const showtime = booking.showtime as unknown as {
       showDate: Date;
       startTime: string;
     } | null;
 
     if (!movie || !cinema || !screen || !showtime) {
-      throw new Error(
-        "Movie, cinema, screen or showtime information is missing."
-      );
+      throw new Error("Booking information is incomplete.");
     }
 
-    // Resolve customer email.
     let customerEmail = booking.guestInfo?.email;
-    let customerName =
-      booking.guestInfo?.name || "Customer";
+    let customerName = booking.guestInfo?.name || "Customer";
 
     if (booking.user) {
       const user = await UserModel.findById(booking.user)
@@ -271,7 +125,7 @@ const sendConfirmationEmailIfNeeded = async (
 
       if (user) {
         customerEmail =
-          customerEmail || user.email;
+          customerEmail || (user.email as string | undefined);
 
         customerName =
           `${user.first_name || ""} ${user.last_name || ""}`.trim() ||
@@ -280,12 +134,9 @@ const sendConfirmationEmailIfNeeded = async (
     }
 
     if (!customerEmail) {
-      throw new Error(
-        `Customer email not found for booking ${booking.bookingCode}.`
-      );
+      throw new Error("Customer email not found.");
     }
 
-    // Prepare ticket details.
     const ticketData: TicketData = {
       bookingCode: booking.bookingCode,
       movieName: movie.title,
@@ -293,21 +144,15 @@ const sendConfirmationEmailIfNeeded = async (
       screenName: screen.name,
       showDate: showtime.showDate,
       startTime: showtime.startTime,
-      seats: booking.seats.map(
-        (seat) => seat.seatId
-      ),
+      seats: booking.seats.map((seat) => seat.seatId),
       totalSeats: booking.totalSeats,
       finalAmount: booking.finalAmount,
       paymentStatus: "Paid",
       bookingStatus: "Confirmed",
     };
 
-    // Generate PDF ticket with QR code.
-    const pdfBuffer = await generateTicketPdf(
-      ticketData
-    );
+    const pdfBuffer = await generateTicketPdf(ticketData);
 
-    // Send PDF ticket to customer.
     await sendBookingConfirmationEmail({
       email: customerEmail,
       customerName,
@@ -315,558 +160,33 @@ const sendConfirmationEmailIfNeeded = async (
       pdfBuffer,
     });
 
-    // Mark email delivery as completed.
     await Payment.updateOne(
-      {
-        _id: paymentId,
-        emailSent: true,
-      },
-      {
-        $set: {
-          emailSentAt: new Date(),
-        },
-      }
-    );
-
-    console.log(
-      `E-ticket email sent successfully: ${booking.bookingCode}`
+      { _id: paymentId, emailSent: true },
+      { $set: { emailSentAt: new Date() } }
     );
   } catch (error) {
-    /*
-     * Do not undo a successful payment if email fails.
-     * Reset the flag so an explicit retry can be made.
-     */
-
     await Payment.updateOne(
       { _id: paymentId },
       {
-        $set: {
-          emailSent: false,
-        },
-        $unset: {
-          emailSentAt: 1,
-        },
+        $set: { emailSent: false },
+        $unset: { emailSentAt: 1 },
       }
     );
 
-    console.error(
-      `E-ticket email failed for booking ${bookingId}:`,
-      error
-    );
+    console.error("E-ticket email failed:", error);
   }
 };
 
-// --------------------------------------------------
-// CREATE CHECKOUT
-// --------------------------------------------------
-
-export const createCheckout = async (
-  req: Request,
-  res: Response
-) => {
-  try {
-    const bookingCode =
-      typeof req.body?.bookingCode === "string"
-        ? req.body.bookingCode.trim().toUpperCase()
-        : "";
-
-    const paymentToken = req.body?.paymentToken;
-
-    if (
-      !bookingCode ||
-      typeof paymentToken !== "string" ||
-      !paymentToken
-    ) {
-      return res.status(400).json({
-        message:
-          "Booking code and payment token are required!",
-      });
-    }
-
-    const booking = await Booking.findOne({
-      bookingCode,
-    })
-      .select("+paymentTokenHash")
-      .populate("movie", "title");
-
-    if (
-      !booking ||
-      !verifyPaymentToken(
-        paymentToken,
-        booking.paymentTokenHash
-      )
-    ) {
-      return res.status(403).json({
-        message: INVALID_LINK_MESSAGE,
-      });
-    }
-
-    if (
-      booking.bookingStatus === "Confirmed" ||
-      booking.bookingStatus === "Completed"
-    ) {
-      return res.status(409).json({
-        message: "This booking is already paid.",
-        code: "ALREADY_PAID",
-      });
-    }
-
-    if (booking.bookingStatus !== "Pending") {
-      return res.status(410).json({
-        message:
-          "This booking is no longer active. Please start again.",
-        code: "BOOKING_NOT_ACTIVE",
-      });
-    }
-
-    const now = new Date();
-
-    if (
-      !booking.holdExpiresAt ||
-      booking.holdExpiresAt.getTime() <= now.getTime()
-    ) {
-      await releaseExpiredHolds({
-        showtimeId: booking.showtime,
-      });
-
-      return res.status(410).json({
-        message:
-          "Your seat hold has expired. Please select your seats again.",
-        code: "HOLD_EXPIRED",
-      });
-    }
-
-    if (
-      !Number.isFinite(booking.finalAmount) ||
-      booking.finalAmount <= 0
-    ) {
-      return res.status(400).json({
-        message:
-          "There is nothing to pay for this booking.",
-      });
-    }
-
-    const attemptsUsed = await Payment.countDocuments({
-      booking: booking._id,
-    });
-
-    if (attemptsUsed >= PAYHERE_MAX_ATTEMPTS) {
-      return res.status(409).json({
-        message:
-          "You have used all payment attempts for this booking.",
-        code: "MAX_ATTEMPTS",
-      });
-    }
-
-    const attempt = attemptsUsed + 1;
-
-    const orderId = buildOrderId(
-      booking.bookingCode,
-      attempt
-    );
-
-    const movieTitle =
-      (
-        booking.movie as unknown as {
-          title?: string;
-        } | null
-      )?.title;
-
-    const customer = await getCheckoutCustomer(
-      booking
-    );
-
-    let checkout;
-
-    try {
-      checkout = buildCheckoutForm({
-        orderId,
-        amount: booking.finalAmount,
-        items: `${movieTitle ?? "Movie tickets"} (${booking.bookingCode})`,
-        customer,
-      });
-    } catch (error) {
-      console.error(
-        "PayHere configuration error:",
-        error
-      );
-
-      return res.status(503).json({
-        message:
-          "Online payment is not available right now. Please try again later.",
-      });
-    }
-
-    try {
-      await Payment.create({
-        orderId,
-        booking: booking._id,
-        user: booking.user ?? null,
-        amount: booking.finalAmount,
-        currency: "LKR",
-        status: "PENDING",
-        attempt,
-        emailSent: false,
-        events: [
-          auditEvent(
-            "PENDING",
-            undefined,
-            `Checkout started (attempt ${attempt})`
-          ),
-        ],
-      });
-    } catch (error) {
-      if (isDuplicateKeyError(error)) {
-        return res.status(409).json({
-          message:
-            "A payment is already being started. Please try again.",
-          code: "ATTEMPT_IN_PROGRESS",
-        });
-      }
-
-      throw error;
-    }
-
-    await Booking.updateOne(
-      {
-        _id: booking._id,
-        bookingStatus: "Pending",
-      },
-      {
-        $set: {
-          paymentStatus: "Pending",
-        },
-      }
-    );
-
-    return res.status(200).json({
-      message: "Checkout ready.",
-      data: {
-        orderId,
-        attempt,
-        attemptsLeft:
-          PAYHERE_MAX_ATTEMPTS - attempt,
-        holdExpiresAt: booking.holdExpiresAt,
-        checkout,
-      },
-    });
-  } catch (error) {
-    console.error("CreateCheckout Error:", error);
-
-    return res.status(500).json({
-      message: "Failed to start the payment!",
-    });
-  }
-};
-
-// --------------------------------------------------
-// PAYHERE NOTIFY
-// --------------------------------------------------
-
-export const handleNotify = async (
-  req: Request,
-  res: Response
-) => {
-  const notification = parseNotification(req.body);
-
-  if (!notification) {
-    return res.status(400).send("Invalid notification");
-  }
-
-  let config;
-
-  try {
-    config = getPayHereConfig();
-  } catch (error) {
-    console.error(
-      "PayHere notify configuration error:",
-      error
-    );
-
-    return res
-      .status(500)
-      .send("Payments are not configured");
-  }
-
-  if (
-    !verifyNotificationSignature(
-      notification,
-      config.merchantSecret
-    )
-  ) {
-    console.warn(
-      `Invalid PayHere signature: ${notification.order_id}`
-    );
-
-    return res.status(400).send("Invalid signature");
-  }
-
-  try {
-    await applyNotification(
-      notification,
-      config.merchantId
-    );
-
-    return res.status(200).send("OK");
-  } catch (error) {
-    console.error(
-      "PayHere notification processing error:",
-      error
-    );
-
-    return res.status(500).send("Error");
-  }
-};
-
-// --------------------------------------------------
-// APPLY PAYHERE NOTIFICATION
-// --------------------------------------------------
-
-const applyNotification = async (
-  notification: PayHereNotification,
-  merchantId: string
-): Promise<void> => {
-  const orderId = notification.order_id
-    .trim()
-    .toUpperCase();
-
-  const mapped = mapStatusCode(
-    notification.status_code
-  );
-
-  if (!mapped) {
-    console.warn(
-      `Unknown PayHere status code: ${notification.status_code}`
-    );
-    return;
-  }
-
-  if (notification.merchant_id !== merchantId) {
-    console.warn(
-      `PayHere merchant mismatch: ${orderId}`
-    );
-    return;
-  }
-
-  const payment = await Payment.findOne({
-    orderId,
-  });
-
-  if (!payment) {
-    console.warn(
-      `Unknown PayHere order: ${orderId}`
-    );
-    return;
-  }
-
-  const statusCode = Number(
-    notification.status_code
-  );
-
-  // Verify amount and currency.
-  if (
-    notification.payhere_currency !== payment.currency ||
-    !amountsMatch(
-      notification.payhere_amount,
-      payment.amount
-    )
-  ) {
-    console.warn(
-      `PayHere amount/currency mismatch: ${orderId}`
-    );
-
-    await Payment.updateOne(
-      { _id: payment._id },
-      {
-        $push: {
-          events: auditEvent(
-            payment.status,
-            statusCode,
-            `Ignored: amount/currency mismatch (${notification.payhere_amount} ${notification.payhere_currency})`
-          ),
-        },
-      }
-    );
-
-    return;
-  }
-
-  const details: Partial<IPayment> = {
-    statusCode,
-  };
-
-  if (notification.status_message) {
-    details.statusMessage =
-      notification.status_message;
-  }
-
-  if (notification.method) {
-    details.method = notification.method;
-  }
-
-  if (notification.payment_id) {
-    details.payherePaymentId =
-      notification.payment_id;
-  }
-
-  try {
-    if (mapped.chargeback) {
-      await applyChargeback(
-        payment,
-        details,
-        statusCode
-      );
-    } else if (mapped.status === "SUCCESS") {
-      await applySuccess(
-        payment,
-        details,
-        statusCode
-      );
-    } else if (mapped.status === "PENDING") {
-      await Payment.updateOne(
-        {
-          _id: payment._id,
-          status: "PENDING",
-          chargedBack: false,
-        },
-        {
-          $set: details,
-          $push: {
-            events: auditEvent(
-              "PENDING",
-              statusCode,
-              "PayHere reports the payment is pending"
-            ),
-          },
-        }
-      );
-    } else {
-      await applyFailureOrCancel(
-        payment,
-        mapped.status,
-        details,
-        statusCode
-      );
-    }
-  } catch (error) {
-    const keyPattern =
-      typeof error === "object" &&
-      error !== null &&
-      "keyPattern" in error
-        ? error.keyPattern
-        : undefined;
-
-    if (
-      isDuplicateKeyError(error) &&
-      typeof keyPattern === "object" &&
-      keyPattern !== null &&
-      "payherePaymentId" in keyPattern
-    ) {
-      console.warn(
-        `PayHere payment ID already used: ${orderId}`
-      );
-      return;
-    }
-
-    throw error;
-  }
-};
-
-// --------------------------------------------------
-// APPLY PAYMENT SUCCESS
-// --------------------------------------------------
-
-const applySuccess = async (
-  payment: IPayment,
-  details: Partial<IPayment>,
-  statusCode: number
-): Promise<void> => {
-  /*
-   * Never restore a payment to SUCCESS if it was
-   * charged back or marked for refund.
-   */
-
-  const updated = await Payment.findOneAndUpdate(
-    {
-      _id: payment._id,
-      chargedBack: false,
-      refundRequired: false,
-      status: { $ne: "SUCCESS" },
-    },
-    {
-      $set: {
-        ...details,
-        status: "SUCCESS",
-        paidAt: new Date(),
-      },
-      $push: {
-        events: auditEvent(
-          "SUCCESS",
-          statusCode,
-          "Payment received"
-        ),
-      },
-    },
-    {
-      new: true,
-    }
-  );
-
-  if (!updated) {
-    // Repeated SUCCESS notification: allow email retry
-    // only if the payment is still eligible.
-    const existing = await Payment.findById(
-      payment._id
-    );
-
-    if (
-      !existing ||
-      existing.status !== "SUCCESS" ||
-      existing.chargedBack ||
-      existing.refundRequired
-    ) {
-      return;
-    }
-  }
-
-  await confirmBookingAfterPayment(
-    payment._id,
-    payment.booking
-  );
-};
-
-// --------------------------------------------------
-// CONFIRM BOOKING AFTER PAYMENT
-// --------------------------------------------------
-
+/**
+ * Confirms the booking first.
+ * Only after confirmation succeeds is the demo payment marked SUCCESS.
+ * Cancelled and expired bookings are never resurrected.
+ */
 const confirmBookingAfterPayment = async (
   paymentId: Types.ObjectId,
   bookingId: Types.ObjectId
-): Promise<void> => {
-  // Only the earliest valid successful payment owns booking.
-  const paymentOwner = await Payment.findOne({
-    booking: bookingId,
-    status: "SUCCESS",
-    chargedBack: false,
-    refundRequired: false,
-  })
-    .sort({ paidAt: 1, _id: 1 })
-    .select("_id")
-    .lean();
-
-  if (!paymentOwner) return;
-
-  if (!paymentOwner._id.equals(paymentId)) {
-    await flagRefund(
-      paymentId,
-      bookingId,
-      "Duplicate successful payment for this booking"
-    );
-    return;
-  }
-
-  // Check if booking is still pending and its hold is valid.
-  const confirmed = await Booking.findOneAndUpdate(
+): Promise<boolean> => {
+  const confirmedBooking = await Booking.findOneAndUpdate(
     {
       _id: bookingId,
       bookingStatus: "Pending",
@@ -881,407 +201,416 @@ const confirmBookingAfterPayment = async (
         paymentTokenHash: null,
       },
     },
-    {
-      new: true,
-    }
+    { new: true }
   );
 
-  if (confirmed) {
-    await sendConfirmationEmailIfNeeded(
-      paymentId,
-      bookingId
-    );
-    return;
-  }
-
-  const booking = await Booking.findById(
-    bookingId
-  );
-
-  if (!booking) return;
-
-  // Already confirmed or completed.
-  if (
-    booking.bookingStatus === "Confirmed" ||
-    booking.bookingStatus === "Completed"
-  ) {
-    if (booking.paymentStatus !== "Paid") {
-      await Booking.updateOne(
-        { _id: bookingId },
-        {
-          $set: {
-            paymentStatus: "Paid",
-          },
-        }
-      );
-    }
-
-    await sendConfirmationEmailIfNeeded(
-      paymentId,
-      bookingId
-    );
-    return;
-  }
-
-  // Do not resurrect a booking if its hold expired.
-  if (
-    booking.bookingStatus === "Cancelled" &&
-    booking.holdExpiresAt &&
-    booking.holdExpiresAt.getTime() > Date.now()
-  ) {
-    try {
-      const resurrected =
-        await Booking.findOneAndUpdate(
-          {
-            _id: bookingId,
-            bookingStatus: "Cancelled",
-            holdExpiresAt: { $gt: new Date() },
-          },
-          {
-            $set: {
-              bookingStatus: "Confirmed",
-              paymentStatus: "Paid",
-              holdExpiresAt: null,
-              paymentTokenHash: null,
-            },
-          },
-          {
-            new: true,
-          }
-        );
-
-      if (resurrected) {
-        await Showtime.updateOne(
-          { _id: booking.showtime },
-          {
-            $inc: {
-              availableSeats: -booking.totalSeats,
-            },
-          }
-        );
-
-        if (booking.offer) {
-          await Offer.updateOne(
-            { _id: booking.offer },
-            {
-              $inc: {
-                usedCount: 1,
-              },
-            }
-          );
-        }
-
-        await sendConfirmationEmailIfNeeded(
-          paymentId,
-          bookingId
-        );
-
-        return;
+  if (!confirmedBooking) {
+    await Payment.updateOne(
+      { _id: paymentId, status: "PENDING" },
+      {
+        $set: {
+          status: "FAILED",
+          statusCode: 3,
+          statusMessage: "Booking could not be confirmed.",
+        },
+        $push: {
+          events: auditEvent(
+            "FAILED",
+            3,
+            "Booking was expired, cancelled, or no longer pending."
+          ),
+        },
       }
-    } catch (error) {
-      if (!isDuplicateKeyError(error)) {
-        throw error;
-      }
-    }
+    );
+
+    return false;
   }
 
-  // Booking no longer has a valid seat hold.
-  await flagRefund(
-    paymentId,
-    bookingId,
-    "Payment received after the seat hold expired or seats were released"
-  );
-};
-
-// --------------------------------------------------
-// FLAG REFUND
-// --------------------------------------------------
-
-const flagRefund = async (
-  paymentId: Types.ObjectId,
-  bookingId: Types.ObjectId,
-  reason: string
-): Promise<void> => {
-  await Payment.updateOne(
+  const successfulPayment = await Payment.findOneAndUpdate(
     {
       _id: paymentId,
-      refundRequired: false,
+      booking: bookingId,
+      status: "PENDING",
     },
     {
       $set: {
-        refundRequired: true,
-        emailSent: false,
-      },
-      $unset: {
-        emailSentAt: 1,
+        status: "SUCCESS",
+        statusCode: 2,
+        statusMessage: "Demo card payment approved.",
+        method: "Demo Card",
+        paidAt: new Date(),
       },
       $push: {
         events: auditEvent(
           "SUCCESS",
-          undefined,
-          `Refund required: ${reason}`
-        ),
-      },
-    }
-  );
-
-  /*
-   * Do not set booking.paymentStatus to Paid here.
-   * A refund-required payment is not a confirmed ticket.
-   * Keep the booking status unchanged for admin review.
-   */
-};
-
-// --------------------------------------------------
-// APPLY PAYMENT FAILURE OR CANCEL
-// --------------------------------------------------
-
-const applyFailureOrCancel = async (
-  payment: IPayment,
-  status: "FAILED" | "CANCELLED",
-  details: Partial<IPayment>,
-  statusCode: number
-): Promise<void> => {
-  const updated = await Payment.findOneAndUpdate(
-    {
-      _id: payment._id,
-      status: "PENDING",
-      chargedBack: false,
-    },
-    {
-      $set: {
-        ...details,
-        status,
-      },
-      $push: {
-        events: auditEvent(
-          status,
-          statusCode,
-          `PayHere reports the payment as ${status}`
+          2,
+          "Demo card payment approved."
         ),
       },
     },
-    {
-      new: true,
-    }
+    { new: true }
   );
 
-  if (!updated) return;
-
-  await mirrorToBooking(updated);
-};
-
-// --------------------------------------------------
-// MIRROR PAYMENT STATUS TO BOOKING
-// --------------------------------------------------
-
-const mirrorToBooking = async (
-  payment: Pick<
-    IPayment,
-    "booking" | "attempt" | "status"
-  >
-): Promise<void> => {
-  const newerAttempt = await Payment.exists({
-    booking: payment.booking,
-    attempt: { $gt: payment.attempt },
-  });
-
-  if (newerAttempt) return;
-
-  const paymentStatus =
-    payment.status === "FAILED"
-      ? "Failed"
-      : payment.status === "CANCELLED"
-        ? "Cancelled"
-        : "Pending";
-
-  if (
-    payment.attempt >= PAYHERE_MAX_ATTEMPTS
-  ) {
-    const released =
-      await Booking.findOneAndUpdate(
-        {
-          _id: payment.booking,
-          bookingStatus: "Pending",
-        },
-        {
-          $set: {
-            bookingStatus: "Cancelled",
-            paymentStatus,
-            holdExpiresAt: null,
-            paymentTokenHash: null,
-          },
-        },
-        {
-          new: true,
-        }
-      );
-
-    if (released) {
-      await restoreBookingCapacity(released);
-    }
-
-    return;
-  }
-
-  await Booking.updateOne(
-    {
-      _id: payment.booking,
-      bookingStatus: "Pending",
-    },
-    {
-      $set: {
-        paymentStatus,
-      },
-    }
-  );
-};
-
-// --------------------------------------------------
-// APPLY CHARGEBACK
-// --------------------------------------------------
-
-const applyChargeback = async (
-  payment: IPayment,
-  details: Partial<IPayment>,
-  statusCode: number
-): Promise<void> => {
-  const before = await Payment.findOneAndUpdate(
-    {
-      _id: payment._id,
-      chargedBack: false,
-    },
-    {
-      $set: {
-        ...details,
-        status: "FAILED",
-        chargedBack: true,
-        refundRequired: false,
-        emailSent: false,
-      },
-      $unset: {
-        emailSentAt: 1,
-      },
-      $push: {
-        events: auditEvent(
-          "FAILED",
-          statusCode,
-          "Chargeback: treated as FAILED"
-        ),
-      },
-    },
-    {
-      new: false,
-    }
-  );
-
-  if (!before) return;
-
-  // If payment was not previously successful,
-  // mirror its failure status.
-  if (before.status !== "SUCCESS") {
-    await mirrorToBooking({
-      booking: before.booking,
-      attempt: before.attempt,
-      status: "FAILED",
-    });
-
-    return;
-  }
-
-  // A previously confirmed booking is cancelled.
-  const cancelled = await Booking.findOneAndUpdate(
-    {
-      _id: payment.booking,
-      bookingStatus: {
-        $in: ["Confirmed", "Completed"],
-      },
-    },
-    {
-      $set: {
-        bookingStatus: "Cancelled",
-        paymentStatus: "Failed",
-        holdExpiresAt: null,
-      },
-    },
-    {
-      new: true,
-    }
-  );
-
-  if (cancelled) {
-    await restoreBookingCapacity(cancelled);
-  } else {
+  if (!successfulPayment) {
+    // Do not silently claim payment succeeded if its record was not updated.
     await Booking.updateOne(
-      { _id: payment.booking },
+      {
+        _id: bookingId,
+        bookingStatus: "Confirmed",
+        paymentStatus: "Paid",
+      },
       {
         $set: {
-          paymentStatus: "Failed",
+          bookingStatus: "Cancelled",
+          paymentStatus: "Cancelled",
         },
       }
     );
+
+    return false;
   }
+
+  await sendConfirmationEmailIfNeeded(paymentId, bookingId);
+
+  return true;
 };
 
-// --------------------------------------------------
-// GET PAYMENT STATUS
-// --------------------------------------------------
-
-export const getPaymentStatus = async (
+export const getDemoBookingSummary = async (
   req: Request,
   res: Response
 ) => {
   try {
-    const orderId = String(
-      req.params.orderId ?? ""
-    )
-      .trim()
-      .toUpperCase();
-
-    if (!/^PH-[A-Z0-9-]{3,40}-\d$/.test(orderId)) {
-      return res.status(404).json({
-        message: "Payment not found!",
+    if (!isDemoPaymentsEnabled()) {
+      return res.status(403).json({
+        message: "Demo payments are currently disabled.",
+        code: "DEMO_DISABLED",
       });
     }
 
-    const payment = await Payment.findOne({
-      orderId,
-    }).select("status attempt booking");
+    const bookingCode =
+      typeof req.body?.bookingCode === "string"
+        ? req.body.bookingCode.trim().toUpperCase()
+        : "";
 
-    if (!payment) {
-      return res.status(404).json({
-        message: "Payment not found!",
+    const paymentToken =
+      typeof req.body?.paymentToken === "string"
+        ? req.body.paymentToken
+        : "";
+
+    if (!bookingCode || !paymentToken) {
+      return res.status(400).json({
+        message: "Booking code and payment token are required.",
       });
     }
 
-    const booking = await Booking.findById(
-      payment.booking
-    ).select("bookingStatus holdExpiresAt");
+    const booking = await Booking.findOne({ bookingCode })
+      .select(
+        "+paymentTokenHash bookingStatus paymentStatus holdExpiresAt finalAmount totalSeats seats movie cinema screen showtime"
+      )
+      .populate("movie", "title")
+      .populate("cinema", "name")
+      .populate("screen", "name")
+      .populate("showtime", "showDate startTime endTime")
+      .lean();
+
+    if (
+      !booking ||
+      !verifyPaymentToken(paymentToken, booking.paymentTokenHash)
+    ) {
+      return res.status(403).json({
+        message: INVALID_LINK_MESSAGE,
+      });
+    }
+
+    if (booking.bookingStatus !== "Pending") {
+      return res.status(410).json({
+        message: "This booking is no longer active.",
+        code: "BOOKING_NOT_ACTIVE",
+      });
+    }
+
+    if (
+      !booking.holdExpiresAt ||
+      booking.holdExpiresAt.getTime() <= Date.now()
+    ) {
+      await releaseExpiredHolds({
+        showtimeId: booking.showtime as Types.ObjectId,
+      });
+
+      return res.status(410).json({
+        message: "Your seat hold has expired.",
+        code: "HOLD_EXPIRED",
+      });
+    }
+
+    const movie = booking.movie as unknown as { title?: string } | null;
+    const cinema = booking.cinema as unknown as { name?: string } | null;
+    const screen = booking.screen as unknown as { name?: string } | null;
+
+    const showtime = booking.showtime as unknown as {
+      showDate?: string | Date;
+      startTime?: string;
+      endTime?: string;
+    } | null;
+
+    if (
+      !movie?.title ||
+      !cinema?.name ||
+      !screen?.name ||
+      !showtime?.showDate ||
+      !showtime?.startTime
+    ) {
+      return res.status(404).json({
+        message: "Booking details are incomplete.",
+      });
+    }
 
     return res.status(200).json({
+      message: "Booking verified.",
       data: {
-        orderId,
-        status: payment.status,
-        bookingStatus:
-          booking?.bookingStatus ?? null,
-        holdExpiresAt:
-          booking?.bookingStatus === "Pending"
-            ? booking.holdExpiresAt ?? null
-            : null,
-        attemptsLeft: Math.max(
-          0,
-          PAYHERE_MAX_ATTEMPTS - payment.attempt
-        ),
+        bookingCode: booking.bookingCode,
+        movieTitle: movie.title,
+        cinemaName: cinema.name,
+        screenName: screen.name,
+        showDate: showtime.showDate,
+        startTime: showtime.startTime,
+        endTime: showtime.endTime ?? null,
+        seats: booking.seats.map((seat) => seat.seatId),
+        totalSeats: booking.totalSeats,
+        amount: Number(booking.finalAmount),
+        currency: "LKR",
+        paymentStatus: booking.paymentStatus,
+        bookingStatus: booking.bookingStatus,
+        holdExpiresAt: booking.holdExpiresAt,
       },
     });
   } catch (error) {
-    console.error(
-      "GetPaymentStatus Error:",
-      error
-    );
+    console.error("GetDemoBookingSummary Error:", error);
 
     return res.status(500).json({
-      message: "Failed to get the payment status!",
+      message: "Failed to load booking details.",
+    });
+  }
+};
+
+export const processDemoPayment = async (
+  req: Request,
+  res: Response
+) => {
+  try {
+    if (!isDemoPaymentsEnabled()) {
+      return res.status(403).json({
+        message: "Demo payments are disabled.",
+        code: "DEMO_DISABLED",
+      });
+    }
+
+    const bookingCode =
+      typeof req.body?.bookingCode === "string"
+        ? req.body.bookingCode.trim().toUpperCase()
+        : "";
+
+    const paymentToken =
+      typeof req.body?.paymentToken === "string"
+        ? req.body.paymentToken
+        : "";
+
+    if (!bookingCode || !paymentToken) {
+      return res.status(400).json({
+        message: "Booking code and payment token are required.",
+      });
+    }
+
+    const booking = await Booking.findOne({ bookingCode })
+      .select(
+        "+paymentTokenHash bookingStatus paymentStatus holdExpiresAt finalAmount user showtime _id"
+      )
+      .lean();
+
+    if (!booking) {
+      return res.status(403).json({
+        message: INVALID_LINK_MESSAGE,
+      });
+    }
+
+    // A successful retry can be acknowledged even though confirmation
+    // has already cleared the one-time payment token.
+    if (
+      booking.bookingStatus === "Confirmed" ||
+      booking.bookingStatus === "Completed"
+    ) {
+      const existing = await Payment.findOne({
+        booking: booking._id,
+        status: "SUCCESS",
+        chargedBack: false,
+        refundRequired: false,
+      })
+        .sort({ paidAt: 1, _id: 1 })
+        .select("orderId amount currency")
+        .lean();
+
+      if (existing) {
+        return res.status(200).json({
+          message: "This booking has already been paid.",
+          data: {
+            orderId: existing.orderId,
+            status: "SUCCESS",
+            bookingStatus: booking.bookingStatus,
+            paymentStatus: "Paid",
+            amount: Number(existing.amount),
+            currency: existing.currency ?? "LKR",
+          },
+        });
+      }
+
+      return res.status(409).json({
+        message: "This booking is already confirmed.",
+        code: "BOOKING_ALREADY_CONFIRMED",
+      });
+    }
+
+    if (!verifyPaymentToken(paymentToken, booking.paymentTokenHash)) {
+      return res.status(403).json({
+        message: INVALID_LINK_MESSAGE,
+      });
+    }
+
+    if (booking.bookingStatus !== "Pending") {
+      return res.status(410).json({
+        message: "This booking is no longer active.",
+        code: "BOOKING_NOT_ACTIVE",
+      });
+    }
+
+    if (
+      !booking.holdExpiresAt ||
+      booking.holdExpiresAt.getTime() <= Date.now()
+    ) {
+      await releaseExpiredHolds({
+        showtimeId: booking.showtime as Types.ObjectId,
+      });
+
+      return res.status(410).json({
+        message: "Your seat hold has expired.",
+        code: "HOLD_EXPIRED",
+      });
+    }
+
+    const amount = Number(booking.finalAmount);
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        message: "Invalid booking amount.",
+      });
+    }
+
+    const existingSuccess = await Payment.findOne({
+      booking: booking._id,
+      status: "SUCCESS",
+      chargedBack: false,
+      refundRequired: false,
+    })
+      .select("orderId amount currency")
+      .lean();
+
+    if (existingSuccess) {
+      return res.status(200).json({
+        message: "Payment already processed.",
+        data: {
+          orderId: existingSuccess.orderId,
+          status: "SUCCESS",
+          bookingStatus: "Confirmed",
+          paymentStatus: "Paid",
+          amount: Number(existingSuccess.amount),
+          currency: existingSuccess.currency ?? "LKR",
+        },
+      });
+    }
+
+    const attemptsUsed = await Payment.countDocuments({
+      booking: booking._id,
+    });
+
+    if (attemptsUsed >= DEMO_MAX_ATTEMPTS) {
+      return res.status(409).json({
+        message: "You have used all available demo payment attempts.",
+        code: "MAX_ATTEMPTS",
+      });
+    }
+
+    const attempt = attemptsUsed + 1;
+    const orderId = normalizeDemoOrderId(bookingCode, attempt);
+
+    const paymentRecord = await Payment.create({
+      orderId,
+      booking: booking._id,
+      user: booking.user ?? null,
+      amount,
+      currency: "LKR",
+      status: "PENDING",
+      attempt,
+      method: "Demo Card",
+      statusMessage: "Demo card payment started.",
+      emailSent: false,
+      events: [
+        auditEvent(
+          "PENDING",
+          0,
+          `Demo payment started (attempt ${attempt}).`
+        ),
+      ],
+    });
+
+    const confirmed = await confirmBookingAfterPayment(
+      paymentRecord._id,
+      booking._id
+    );
+
+    if (!confirmed) {
+      return res.status(409).json({
+        message: "Booking confirmation failed. Please start again.",
+        code: "BOOKING_CONFIRMATION_FAILED",
+      });
+    }
+
+    const successfulPayment = await Payment.findById(
+      paymentRecord._id
+    ).select("orderId amount currency status");
+
+    if (!successfulPayment || successfulPayment.status !== "SUCCESS") {
+      return res.status(500).json({
+        message: "Payment confirmation could not be completed.",
+      });
+    }
+
+    return res.status(200).json({
+      message: "Demo payment processed successfully.",
+      data: {
+        orderId: successfulPayment.orderId,
+        status: "SUCCESS",
+        bookingStatus: "Confirmed",
+        paymentStatus: "Paid",
+        amount: Number(successfulPayment.amount),
+        currency: successfulPayment.currency ?? "LKR",
+      },
+    });
+  } catch (error: unknown) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === 11000
+    ) {
+      return res.status(409).json({
+        message: "A payment attempt is already being processed.",
+        code: "ATTEMPT_IN_PROGRESS",
+      });
+    }
+
+    console.error("Demo payment error:", error);
+
+    return res.status(500).json({
+      message: "Failed to process the demo payment.",
     });
   }
 };

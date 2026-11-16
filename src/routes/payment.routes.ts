@@ -1,10 +1,7 @@
-import express, { Router } from "express";
+import { Router } from "express";
 import type { NextFunction, Request, Response } from "express";
-import {
-  createCheckout,
-  getPaymentStatus,
-  handleNotify,
-} from "../controllers/payment.controller";
+
+import { processDemoPayment } from "../controllers/payment.controller";
 
 const router = Router();
 
@@ -13,12 +10,6 @@ const noStore = (_req: Request, res: Response, next: NextFunction) => {
   next();
 };
 
-router.post("/checkout", noStore, createCheckout);
-router.post(
-  "/notify",
-  express.urlencoded({ extended: false, limit: "10kb" }),
-  handleNotify
-);
-router.get("/status/:orderId", noStore, getPaymentStatus);
+router.post("/demo", noStore, processDemoPayment);
 
 export default router;
